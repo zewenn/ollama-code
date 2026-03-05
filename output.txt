@@ -1,0 +1,29 @@
+
+calc.c:49:13: error: call to undeclared library function 'isdigit' with type 'int (int)'; ISO C99 and later do not support implicit function declarations [-Wimplicit-function-declaration]
+   49 |         if (isdigit(c)) {
+      |             ^
+calc.c:49:13: note: include the header <ctype.h> or explicitly provide a declaration for 'isdigit'
+calc.c:68:60: error: too many arguments to function call, expected 2, have 3
+   68 |             parser_error(NULL, "Unexpected character: %c", c);
+      |             ~~~~~~~~~~~~                                   ^
+calc.c:34:6: note: 'parser_error' declared here
+   34 | void parser_error(Parser *parser, const char *message);
+      |      ^            ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+calc.c:94:17: error: no member named 'current' in 'struct Parser'
+   94 |         parser->current
+      |         ~~~~~~  ^
+calc.c:94:24: error: expected ';' after expression
+   94 |         parser->current
+      |                        ^
+      |                        ;
+calc.c:94:24: error: expected '}'
+calc.c:91:47: note: to match this '{'
+   91 |     if (parser->pos >= strlen(parser->input)) {
+      |                                               ^
+calc.c:94:24: error: expected '}'
+   94 |         parser->current
+      |                        ^
+calc.c:85:34: note: to match this '{'
+   85 | void parser_next(Parser *parser) {
+      |                                  ^
+6 errors generated.

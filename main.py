@@ -1,0 +1,889 @@
+"""
+Ollama chat TUI — single-file, well-architected.
+
+Usage:
+    python main.py <directory_path>
+
+Architecture:
+    Symbol / TextBox / Canvas  – low-level terminal drawing primitives (unchanged)
+    AppState                   – thread-safe shared state
+    OllamaWorker               – streams Ollama responses on a background thread
+    Renderer                   – builds each frame from AppState
+    helpers                    – file-tree / prompt / notification utilities
+    main()                     – event loop: render → wait for input → dispatch
+"""
+
+from __future__ import annotations
+
+import fnmatch
+import getpass
+import os
+import platform
+import re
+import sys
+import threading
+import time
+from dataclasses import dataclass, field
+from enum import Enum, auto
+from pathlib import Path
+from typing import List, Optional, Tuple
+
+import ollama
+from plyer import notification
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Drawing primitives
+# ═══════════════════════════════════════════════════════════════════════════════
+
+
+class Symbol:
+    """A single drawable character plus optional ANSI escape sequence."""
+
+    def __init__(self, character: str = "\0", escape_sequence: str = "\u001b[0m"):
+        self.content: str = character
+        self.escape_sequence: str = escape_sequence
+
+    def __eq__(self, other) -> bool:
+        if isinstance(other, Symbol):
+            return (
+                self.content == other.content
+                and self.escape_sequence == other.escape_sequence
+            )
+        if isinstance(other, str):
+            return self.content == other
+        return NotImplemented
+
+    def __repr__(self) -> str:
+        return f"Symbol({self.content!r})"
+
+    def __str__(self) -> str:
+        return f"{self.escape_sequence}{self.content}"
+
+    @staticmethod
+    def from_string(text: str) -> List[Symbol]:
+        """Parse a markup string into a list of Symbol objects.
+
+        Supported markup tags (prefixed with %):
+            %reset          – reset colour/style
+            %color(r,g,b)   – set 24-bit foreground colour
+            %bold           – bold text
+            %underline      – underline text
+        """
+        symbols: List[Symbol] = []
+        escape_sequence = "\u001b[0m"
+        i = 0
+
+        while i < len(text):
+            index = i
+            i += 1
+
+            if text[index] != "%":
+                symbols.append(Symbol(text[index], escape_sequence))
+                continue
+
+            def peek(tag: str) -> bool:
+                end = index + 1 + len(tag)
+                return text[index + 1 : end] == tag
+
+            if peek("reset"):
+                escape_sequence = "\u001b[0m"
+                i = index + 6
+            elif peek("color("):
+                rest = text[index + 7 :]
+                end = rest.find(")")
+                if end == -1:
+                    symbols.append(Symbol("%", escape_sequence))
+                    continue
+                parts = rest[:end].split(",")
+                if len(parts) != 3:
+                    symbols.append(Symbol("%", escape_sequence))
+                    continue
+                try:
+                    r, g, b = int(parts[0]), int(parts[1]), int(parts[2])
+                except ValueError:
+                    symbols.append(Symbol("%", escape_sequence))
+                    continue
+                escape_sequence += f"\u001b[38;2;{r};{g};{b}m"
+                i = index + 7 + end + 1
+            elif peek("bold"):
+                escape_sequence += "\u001b[1m"
+                i = index + 5
+            elif peek("underline"):
+                escape_sequence += "\u001b[4m"
+                i = index + 10
+            else:
+                symbols.append(Symbol("%", escape_sequence))
+
+        return symbols
+
+    @staticmethod
+    def buffer(width: int, height: int) -> List[List[Symbol]]:
+        return [[Symbol(" ") for _ in range(width)] for _ in range(height)]
+
+    @staticmethod
+    def null_buffer(width: int, height: int) -> List[List[Symbol]]:
+        return [[Symbol("\0") for _ in range(width)] for _ in range(height)]
+
+
+class Alignment(Enum):
+    min = auto()
+    center = auto()
+    max = auto()
+
+
+class TextBox:
+    """Simple text-layout helper with horizontal/vertical alignment."""
+
+    def __init__(
+        self,
+        width: int,
+        height: int,
+        text: Optional[str] = None,
+        horizontal_alignment: Alignment = Alignment.min,
+        vertical_alignment: Alignment = Alignment.min,
+    ):
+        self.width = width
+        self.height = height
+        self.horizontal_alignment = horizontal_alignment
+        self.vertical_alignment = vertical_alignment
+        self._buffer: List[List[Symbol]] = Symbol.buffer(width, height)
+
+        if text is not None:
+            self.content(text)
+        else:
+            self.update_alignment()
+
+    def clear(self) -> None:
+        self._buffer = Symbol.buffer(self.width, self.height)
+
+    def get(self, x: int, y: int) -> Symbol:
+        if x >= self.width or y >= self.height:
+            return Symbol()
+        return self._buffer[y][x]
+
+    def content(self, text: str) -> None:
+        symbols = Symbol.from_string(text)
+        y, x = 0, 0
+        for ch in symbols:
+            if x >= self.width or ch.content == "\n":
+                y += 1
+                if y >= self.height:
+                    break
+                x = 0
+                continue
+            self._buffer[y][x] = ch
+            x += 1
+        self.update_alignment()
+
+    def update_alignment(self) -> None:
+        self.align_horizontal(self.horizontal_alignment)
+        self.align_vertical(self.vertical_alignment)
+
+    def align_horizontal(self, align: Alignment) -> None:
+        if align == Alignment.min:
+            return
+        self.horizontal_alignment = align
+        new_buffer = Symbol.buffer(self.width, self.height)
+        for y in range(self.height):
+            spaces = sum(
+                1
+                for x in range(self.width)
+                if self._buffer[y][x].content in (" ", "\t", "\0")
+            )
+            add = spaces // 2 if align == Alignment.center else spaces
+            for x in range(self.width):
+                if x + add >= self.width:
+                    break
+                new_buffer[y][x + add] = self._buffer[y][x]
+        self._buffer = new_buffer
+
+    def align_vertical(self, align: Alignment) -> None:
+        if align == Alignment.min:
+            return
+        self.vertical_alignment = align
+        new_buffer = Symbol.buffer(self.width, self.height)
+        newlines = 0
+        for y in range(self.height):
+            has_content = any(
+                self._buffer[y][x].content not in (" ", "\t", "\0")
+                for x in range(self.width)
+            )
+            newlines = 0 if has_content else newlines + 1
+        add = newlines // 2 if align == Alignment.center else newlines
+        for y in range(self.height):
+            if y + add >= self.height:
+                break
+            for x in range(self.width):
+                new_buffer[y + add][x] = self._buffer[y][x]
+        self._buffer = new_buffer
+
+
+class Canvas:
+    """Console-based canvas. Writes only changed cells to reduce flicker."""
+
+    _IS_WINDOWS = platform.system() == "Windows"
+
+    def __init__(self, w: int, h: int):
+        self._terminal_width: int = 0
+        self._terminal_height: int = 0
+        self._is_cursor_hidden: bool = False
+        self._position_x: int = 0
+        self._position_y: int = 2
+        self.width: int = 0
+        self.height: int = 0
+        self._cache_buffer: List[List[Symbol]] = Symbol.buffer(0, 0)
+        self._frame_buffer: List[List[Symbol]] = Symbol.buffer(0, 0)
+        self.resize(w, h)
+
+    # ── Terminal helpers ────────────────────────────────────────────────────
+
+    def _get_terminal_size(self) -> Tuple[int, int]:
+        size = os.get_terminal_size()
+        return size.columns, size.lines
+
+    # ── Cursor helpers ──────────────────────────────────────────────────────
+
+    def hide_cursor(self) -> None:
+        self._is_cursor_hidden = True
+        sys.stdout.write("\u001b[?25l")
+        sys.stdout.flush()
+
+    def show_cursor(self) -> None:
+        self._is_cursor_hidden = False
+        sys.stdout.write("\u001b[?25h")
+        sys.stdout.flush()
+
+    def toggle_cursor(self) -> None:
+        if self._is_cursor_hidden:
+            self.show_cursor()
+        else:
+            self.hide_cursor()
+
+    def set_cursor_position(self, left: int, top: int) -> None:
+        left, top = max(left, 0), max(top, 0)
+        try:
+            tw, th = self._get_terminal_size()
+            flag = left > self.width + self._position_x or top > self.height + 3
+            if flag:
+                left = min(self.width + self._position_x, tw - 1)
+                top = min(self.height + 3, th - 1)
+            sys.stdout.write(f"\u001b[{top + 1};{left + 1}H")
+            sys.stdout.flush()
+        except Exception:
+            pass
+
+    # ── Reset / resize ──────────────────────────────────────────────────────
+
+    def reset_console(self) -> None:
+        self._cache_buffer = Symbol.buffer(self.width, self.height)
+        self._frame_buffer = Symbol.buffer(self.width, self.height)
+        sys.stdout.write("\u001b[0m\u001b[2J")
+        sys.stdout.flush()
+        self.show_cursor()
+
+    def clear(self) -> None:
+        self.resize(self.width, self.height)
+
+    def resize(self, width: int = None, height: int = None) -> None:  # type: ignore[assignment]
+        if width is None or height is None:
+            tw, th = self._get_terminal_size()
+            width = width if width is not None else tw
+            height = height if height is not None else th
+
+        self.reset_console()
+        if hasattr(sys.stdout, "reconfigure"):
+            sys.stdout.reconfigure(encoding="utf-8")  # type: ignore[union-attr]
+
+        tw, th = self._get_terminal_size()
+        self._terminal_width = tw
+        self._terminal_height = th
+        self.hide_cursor()
+        self.width = width
+        self.height = height
+        self._position_x = max(1, tw // 2 - self.width // 2)
+        self._cache_buffer = Symbol.buffer(self.width, self.height)
+        self._frame_buffer = Symbol.buffer(self.width, self.height)
+
+        buf: List[str] = []
+        for y in range(-1, self.height + 1):
+            for x in range(-1, self.width + 1):
+                col = self._position_x + x
+                row = self._position_y + y
+                buf.append(f"\u001b[{row + 1};{col + 1}H")
+                if y == -1:
+                    buf.append("╭" if x == -1 else ("╮" if x == self.width else "─"))
+                elif y == self.height:
+                    buf.append("╰" if x == -1 else ("╯" if x == self.width else "─"))
+                elif x == -1 or x == self.width:
+                    buf.append("│")
+                else:
+                    buf.append(" ")
+
+        sys.stdout.write("".join(buf))
+        sys.stdout.flush()
+
+    # ── Drawing primitives ──────────────────────────────────────────────────
+
+    def text(
+        self, start_x: int, start_y: int, text: str, overflow: bool = True
+    ) -> None:
+        symbols = Symbol.from_string(text)
+        y, x = start_y, 0
+        for symbol in symbols:
+            if (start_x + x >= self.width and overflow) or symbol.content == "\n":
+                y += 1
+                if y >= self.height:
+                    break
+                x = 0
+                continue
+            dx = x
+            x += 1
+            if start_x + dx < 0 or y < 0:
+                continue
+            if start_x + dx >= self.width and not overflow:
+                continue
+            self._frame_buffer[y][start_x + dx] = symbol
+
+    def text_box(self, start_x: int, start_y: int, text_box: TextBox) -> None:
+        for tb_y in range(text_box.height):
+            y = start_y + tb_y
+            if y >= self.height:
+                break
+            for tb_x in range(text_box.width):
+                x = start_x + tb_x
+                if x >= self.width:
+                    break
+                s = text_box.get(tb_x, tb_y)
+                if s.content != "\0" and s.content not in (" ", "\t"):
+                    self._frame_buffer[y][x] = s
+
+    # ── Flush ───────────────────────────────────────────────────────────────
+
+    def draw(self) -> None:
+        tw, th = self._get_terminal_size()
+        if tw != self._terminal_width or th != self._terminal_height:
+            self._terminal_width = tw
+            self._terminal_height = th
+            self.resize(self.width, self.height)
+            self._cache_buffer = Symbol.buffer(self.width, self.height)
+
+        if self.height > self._terminal_height or self.width > self._terminal_width:
+            midtext = "Please resize the console!"
+            subtext = "(Minimum 96x36)"
+            mx = min(self._terminal_width, self.width) // 2
+            my = min(self._terminal_height, self.height) // 2
+            self.set_cursor_position(mx - len(midtext) // 2, my)
+            sys.stdout.write(midtext)
+            self.set_cursor_position(mx - len(subtext) // 2, my + 1)
+            sys.stdout.write(subtext)
+            self.move_cursor_to_bottom(0)
+            sys.stdout.flush()
+            return
+
+        out: List[str] = []
+        for y in range(min(self.height, self._terminal_height)):
+            for x in range(min(self.width, self._terminal_width)):
+                cache_sym = self._cache_buffer[y][x]
+                frame_sym = self._frame_buffer[y][x]
+                if cache_sym == frame_sym:
+                    continue
+                self._cache_buffer[y][x].content = frame_sym.content
+                self._cache_buffer[y][x].escape_sequence = frame_sym.escape_sequence
+                col = self._position_x + x
+                row = self._position_y + y
+                out.append(f"\u001b[{row + 1};{col + 1}H{frame_sym}")
+            out.append("\u001b[0m")
+
+        sys.stdout.write("".join(out))
+        self.move_cursor_to_bottom()
+        sys.stdout.flush()
+        self.clear_buffer()
+
+    def clear_buffer(self) -> None:
+        self._frame_buffer = Symbol.buffer(self.width, self.height)
+
+    def move_cursor_to_bottom(self, x: int = 0) -> None:
+        self.set_cursor_position(self._position_x + x, self.height + 2)
+
+    def clear_line(self, y: int = -1) -> None:
+        if y < 0:
+            y = self.height + 4
+        self.set_cursor_position(self._position_x, y)
+        sys.stdout.write("\u001b[0m" + " " * self.width)
+        self.set_cursor_position(self._position_x, y)
+        sys.stdout.flush()
+
+    def read_line(self, prompt: str, default=None):
+        """Block and read a line of user input from below the canvas."""
+        input_row = self.height + 3
+        self.clear_line(input_row)
+        self.set_cursor_position(self._position_x, input_row)
+        self.show_cursor()
+        sys.stdout.write(prompt)
+        sys.stdout.flush()
+        try:
+            raw = input()
+            result = type(default)(raw) if default is not None else raw
+        except Exception:
+            result = default
+        self.clear_line(input_row)
+        self.hide_cursor()
+        return result
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# App State  (shared between main thread and OllamaWorker thread)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+
+@dataclass
+class AppState:
+    messages: List[dict] = field(default_factory=list)
+    """Full conversation history (user + assistant turns)."""
+
+    current_output: str = ""
+    """Accumulates tokens from the currently streaming response."""
+
+    think_output: str = ""
+    """Accumulates thinking text (inside <think>…</think>) while streaming."""
+
+    think_start_time: float = 0.0
+    """Wall-clock time when the current <think> block started."""
+
+    think_duration: float = 0.0
+    """Seconds spent in the last completed think block (0 = no think yet)."""
+
+    model_busy: bool = False
+    """True while the Ollama thread is running — blocks user input."""
+
+    pending_updates: dict = field(default_factory=dict)
+    """File paths → content proposed by the model via %update% blocks."""
+
+    lock: threading.Lock = field(default_factory=threading.Lock)
+    running: bool = True
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Ollama Worker
+# ═══════════════════════════════════════════════════════════════════════════════
+
+_SPINNER = ["·", "✻", "✽", "✶", "✳", "✢", "✳", "✶", "✽", "✻"]
+_MODEL = "qwen3:8b"
+
+
+class OllamaWorker:
+    """Streams an Ollama chat response on a background daemon thread,
+    writing tokens into AppState.current_output as they arrive."""
+
+    def __init__(self, state: AppState) -> None:
+        self._state = state
+
+    def start(self, messages: List[dict], system_prompt: str) -> None:
+        """Spawn a new daemon thread for the current request."""
+        threading.Thread(
+            target=self._run,
+            args=(list(messages), system_prompt),
+            daemon=True,
+        ).start()
+
+    def _run(self, messages: List[dict], system_prompt: str) -> None:
+        output = ""
+        think_text = ""
+        thinking = False
+
+        try:
+            response = ollama.chat(
+                _MODEL,
+                [{"role": "system", "content": system_prompt}] + messages,
+                stream=True,
+            )
+
+            for token in response:
+                content: str = token.message.content or ""
+                if not content:
+                    continue
+
+                if "<think>" in content:
+                    thinking = True
+                    with self._state.lock:
+                        self._state.think_start_time = time.time()
+                if "</think>" in content:
+                    thinking = False
+                    with self._state.lock:
+                        self._state.think_duration = (
+                            time.time() - self._state.think_start_time
+                        )
+                    continue
+
+                if thinking:
+                    # Accumulate think text and push last 3 lines to state
+                    think_text += content
+                    with self._state.lock:
+                        self._state.think_output = think_text
+                    continue
+
+                output += content
+                with self._state.lock:
+                    self._state.current_output = output
+
+        except Exception as exc:
+            output = f"[ERROR] {exc}"
+            with self._state.lock:
+                self._state.current_output = output
+
+        finally:
+            with self._state.lock:
+                if output and not output.startswith("[ERROR]"):
+                    self._state.messages.append(
+                        {"role": "assistant", "content": output}
+                    )
+                self._state.pending_updates = extract_files(output)
+                self._state.current_output = ""
+                self._state.think_output = ""
+                # think_duration is intentionally kept so the renderer can show "thought for X s"
+                self._state.model_busy = False
+
+            _send_notification(
+                _MODEL, (output[:40] + "…") if len(output) > 40 else output
+            )
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Renderer
+# ═══════════════════════════════════════════════════════════════════════════════
+
+
+def _wrap_lines(text: str, width: int) -> List[str]:
+    """Split *text* into lines no wider than *width*, honouring newlines."""
+    result: List[str] = []
+    for paragraph in text.split("\n"):
+        if not paragraph:
+            result.append("")
+            continue
+        while len(paragraph) > width:
+            result.append(paragraph[:width])
+            paragraph = paragraph[width:]
+        result.append(paragraph)
+    return result
+
+
+def _shimmer_line(text: str, tick: int, speed: float = 0.4, band: int = 10) -> str:
+    """Return a markup string for *text* with a left-to-right shimmer sweep.
+
+    A bright band travels across the full line width every ~3 s at the default
+    speed. Characters inside the band are lit to rgb(195,195,195); outside they
+    stay at rgb(100,100,100).
+    """
+    if not text:
+        return ""
+
+    total = len(text) + band  # shimmer travels over text + off-screen tail
+    pos = (tick * speed) % total  # current leading edge of the bright band
+
+    out: List[str] = []
+    prev_r, prev_g, prev_b = -1, -1, -1
+
+    for i, ch in enumerate(text):
+        dist = pos - i
+        if 0 <= dist < band:
+            # smooth falloff: brightest at dist == band/2
+            t = 1.0 - abs(dist - band / 2) / (band / 2)
+            r = int(100 + 95 * t)
+            g = int(100 + 95 * t)
+            b = int(100 + 95 * t)
+        else:
+            r, g, b = 100, 100, 100
+
+        if (r, g, b) != (prev_r, prev_g, prev_b):
+            out.append(f"%color({r},{g},{b})")
+            prev_r, prev_g, prev_b = r, g, b
+
+        out.append(ch)
+
+    return "".join(out)
+
+
+def render_frame(canvas: Canvas, state: AppState, tick: int) -> None:
+    """Build one frame inside *canvas* from the current *state*."""
+    W = canvas.width
+    H = canvas.height
+    CONTENT_W = W - 4  # usable text width (2 chars padding each side)
+    # User bubble zone: starts at 40% of canvas, ends 1 char from right border
+    USER_ZONE_START = int(W * 0.4)
+    USER_W = W - 3 - USER_ZONE_START  # wrap width for user text
+    THINK_ROWS = 3
+    STATUS_ROW = H - 1
+
+    with state.lock:
+        messages = list(state.messages)
+        current = state.current_output
+        think_text = state.think_output
+        think_dur = state.think_duration
+        busy = state.model_busy
+
+    username = getpass.getuser()
+
+    # ── Identify last assistant message index ─────────────────────────────
+    last_asst_idx = max(
+        (i for i, m in enumerate(messages) if m["role"] == "assistant"),
+        default=-1,
+    )
+
+    # all_lines stores (x_offset, markup_text) tuples
+    all_lines: List[Tuple[int, str]] = []
+
+    for idx, msg in enumerate(messages):
+        is_user = msg["role"] == "user"
+
+        # Header line: username (right-aligned) or model name (left)
+        if is_user:
+            hdr_x = max(W - 3 - len(username), USER_ZONE_START)
+            all_lines.append((hdr_x, "%color(70,70,70)" + username))
+        else:
+            all_lines.append((1, "%color(70,70,70)" + _MODEL))
+
+        # "thought for X s." before the last assistant message
+        if idx == last_asst_idx and think_dur > 0 and not busy:
+            secs = f"{think_dur:.1f}"
+            all_lines.append((1, f"%color(80,80,80)│ thought for {secs}s."))
+
+        content_lines = _wrap_lines(msg["content"], USER_W if is_user else CONTENT_W)
+        for i, line in enumerate(content_lines):
+            if is_user:
+                line_x = max(W - 3 - len(line), USER_ZONE_START)
+                all_lines.append((line_x, "%color(120,180,255)" + line))
+            else:
+                all_lines.append((1, line))
+
+        all_lines.append((1, ""))  # blank line between turns
+
+    # In-progress assistant reply (streaming)
+    if current:
+        all_lines.append((1, "%color(70,70,70)" + _MODEL))
+        content_lines = _wrap_lines(current, CONTENT_W)
+        for i, line in enumerate(content_lines):
+            all_lines.append((1, line))
+
+    # ── Layout: when thinking reserve rows for the think block ────────────
+    if busy:
+        visible_rows = STATUS_ROW - THINK_ROWS
+    else:
+        visible_rows = STATUS_ROW
+
+    display_lines = (
+        all_lines[-visible_rows:] if len(all_lines) > visible_rows else all_lines
+    )
+
+    # Bottom-align (Discord-style)
+    start_y = max(0, visible_rows - len(display_lines))
+    for i, (x, line) in enumerate(display_lines):
+        canvas.text(x, start_y + i, line)
+
+    # ── Status bar ─────────────────────────────────────────────────────────
+    if busy:
+        spin = _SPINNER[tick % len(_SPINNER)]
+        status = f"%color(210,120,40){spin}%reset " + _shimmer_line("thinking…", tick)
+        canvas.text(1, STATUS_ROW, status)
+    else:
+        ready_text = "ready — type below"
+        ready_x = max(0, (W - len(ready_text)) // 2)
+        canvas.text(ready_x, STATUS_ROW, "%color(80,80,80)" + ready_text)
+
+    # ── Live think lines (only while busy) — fills bottom-to-top ──────────
+    if busy and think_text:
+        clean = re.sub(r"</?think>", "", think_text)
+        flat = " ".join(clean.split())
+        # W - 6: 1 left (x=1) + "│ " prefix (2) + 1 right margin + 2 border = 6
+        think_display = _wrap_lines(flat, W - 6)[-THINK_ROWS:]
+        base_row = STATUS_ROW - 1
+        n = len(think_display)
+        for i, tl in enumerate(think_display):
+            row = base_row - (n - 1 - i)
+            canvas.text(1, row, "%color(80,80,80)│%reset %color(100,100,100)" + tl)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Filesystem / prompt helpers
+# ═══════════════════════════════════════════════════════════════════════════════
+
+
+def extract_files(markdown: str) -> dict:
+    pattern = r"%update%\s+(\S+)\s*\n```[^\n]*\n(.*?)```"
+    return {path: content for path, content in re.findall(pattern, markdown, re.DOTALL)}
+
+
+def _load_ignore_patterns(root: Path) -> List[str]:
+    patterns = [".git", "__pycache__", "*.pyc", ".DS_Store", ".vscode"]
+    ignore_file = root / ".gitignore"
+    if ignore_file.exists():
+        for line in ignore_file.read_text().splitlines():
+            line = line.strip()
+            if line and not line.startswith("#"):
+                patterns.append(line)
+    return patterns
+
+
+def _is_ignored(path: Path, root: Path, patterns: List[str]) -> bool:
+    rel = path.relative_to(root)
+    rel_str = str(rel)
+    return any(
+        fnmatch.fnmatch(rel_str, p)
+        or fnmatch.fnmatch(path.name, p)
+        or any(fnmatch.fnmatch(part, p) for part in rel.parts)
+        for p in patterns
+    )
+
+
+def _generate_tree(
+    path: Path, root: Path, patterns: List[str], prefix: str = ""
+) -> str:
+    built = f"{prefix}{path.name}/\n"
+    items = [
+        i
+        for i in sorted(path.iterdir(), key=lambda x: (x.is_file(), x.name.lower()))
+        if not _is_ignored(i, root, patterns)
+    ]
+    for idx, item in enumerate(items):
+        is_last = idx == len(items) - 1
+        pointer = "└── " if is_last else "├── "
+        if item.is_dir():
+            ext = "    " if is_last else "│   "
+            built += _generate_tree(item, root, patterns, prefix=prefix + ext)
+        else:
+            built += f"{prefix}{pointer}{item.name}\n"
+    return built
+
+
+def _gather_file_contents(root: Path, patterns: List[str]) -> str:
+    parts = ["## File Contents:"]
+    for fp in root.rglob("*"):
+        if fp.is_file() and not _is_ignored(fp, root, patterns):
+            try:
+                content = fp.read_text(encoding="utf-8")
+                parts.append(f"Contents of `{fp.relative_to(root)}`:")
+                parts.append(f"```\n{content.strip()}\n```\n")
+            except (UnicodeDecodeError, PermissionError):
+                continue
+    return "\n".join(parts)
+
+
+def generate_system_prompt(cwd: str) -> str:
+    path = Path(cwd).resolve()
+    patterns = _load_ignore_patterns(path)
+
+    prompt = "# Project Information\n"
+    prompt += "> Refer to the following when answering the user's prompt.\n\n"
+    prompt += "## Directory File Structure:\n```\n"
+    prompt += _generate_tree(path, path, patterns)
+    prompt += "```\n\n"
+    prompt += _gather_file_contents(path, patterns)
+    prompt += "\n# Guidelines\n"
+    prompt += "- Look up language specs for the correct version when writing code.\n"
+    prompt += "- Triple-check gathered information before responding.\n"
+    prompt += "- Follow the style of the user's existing code.\n"
+    prompt += "- Cite sources and be accurate.\n"
+    prompt += "\n## File Changes\n"
+    prompt += (
+        "To modify a file use **exactly** this syntax (full file contents only):\n"
+    )
+    prompt += "%update% <filepath>\n```<code>```\n"
+    prompt += "Always rewrite the complete file — no partial changes.\n"
+    prompt += "\n## Response Style\n"
+    prompt += "Keep replies concise. Only point out non-obvious issues.\n"
+    prompt += "Do not overthink simple tasks.\n"
+    return prompt
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Notification helper
+# ═══════════════════════════════════════════════════════════════════════════════
+
+
+def _send_notification(title: str, message: str) -> None:
+    threading.Thread(
+        target=lambda: notification.notify(title=title, message=message, timeout=5),  # type: ignore
+        daemon=True,
+    ).start()
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Entry point
+# ═══════════════════════════════════════════════════════════════════════════════
+
+
+def main(argv: Tuple[str, ...]) -> None:
+    if len(argv) < 2:
+        print("Usage: python main.py <directory_path>")
+        return
+
+    target_path = argv[1]
+    state = AppState()
+    worker = OllamaWorker(state)
+
+    tw = os.get_terminal_size().columns
+    th = os.get_terminal_size().lines
+    canvas = Canvas(tw, th - 8)
+
+    tick = 0
+
+    while state.running:
+        # ── Handle terminal resize ─────────────────────────────────────────
+        size = os.get_terminal_size()
+        if size.columns != tw or size.lines != th:
+            tw, th = size.columns, size.lines
+            canvas.resize(tw, th - 8)
+
+        # ── Render current frame ───────────────────────────────────────────
+        render_frame(canvas, state, tick)
+        canvas.draw()
+        tick += 1
+
+        # ── While model is busy, just keep updating the display ────────────
+        if state.model_busy:
+            time.sleep(0.05)
+            continue
+
+        # ── Apply any pending file updates proposed by the model ───────────
+        with state.lock:
+            pending = dict(state.pending_updates)
+            state.pending_updates.clear()
+
+        for rel_path, content in pending.items():
+            abs_path = os.path.join(os.path.realpath(target_path), rel_path)
+            if not os.path.exists(abs_path):
+                canvas.text(
+                    0,
+                    canvas.height - 2,
+                    f"%color(255,100,100)Path not found: {abs_path}",
+                )
+                canvas.draw()
+                time.sleep(1.5)
+                continue
+            answer = canvas.read_line(f"Write to ./{rel_path}? [Y/n]: ")
+            if (answer or "").strip().lower() not in ("n", "no"):
+                with open(abs_path, "w", encoding="utf-8") as fh:
+                    fh.write(content)
+
+        # ── Read user input (only reached when model is idle) ──────────────
+        user_input = (canvas.read_line("> ") or "").strip()
+
+        if user_input.lower() in ("bye", "quit", "exit", ""):
+            state.running = False
+            break
+
+        # ── Dispatch to Ollama on a background thread ──────────────────────
+        with state.lock:
+            state.messages.append({"role": "user", "content": user_input})
+            messages_snapshot = list(state.messages)
+            state.model_busy = True
+            state.current_output = ""
+
+        system_prompt = generate_system_prompt(target_path)
+        worker.start(messages_snapshot, system_prompt)
+
+    canvas.reset_console()
+
+
+if __name__ == "__main__":
+    main(tuple(sys.argv))
