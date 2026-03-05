@@ -21,6 +21,7 @@ import os
 import platform
 import re
 import sys
+import termios
 import threading
 import time
 from dataclasses import dataclass, field
@@ -30,6 +31,7 @@ from typing import List, Optional, Tuple
 
 import ollama
 from plyer import notification
+from pynput import keyboard as _kb
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -305,6 +307,8 @@ class Canvas:
         self._cache_buffer = Symbol.buffer(self.width, self.height)
         self._frame_buffer = Symbol.buffer(self.width, self.height)
 
+        _B = "\u001b[38;2;55;55;65m"  # muted blue-gray
+        _R = "\u001b[0m"
         buf: List[str] = []
         for y in range(-1, self.height + 1):
             for x in range(-1, self.width + 1):
@@ -312,11 +316,19 @@ class Canvas:
                 row = self._position_y + y
                 buf.append(f"\u001b[{row + 1};{col + 1}H")
                 if y == -1:
-                    buf.append("╭" if x == -1 else ("╮" if x == self.width else "─"))
+                    buf.append(
+                        _B
+                        + ("╭" if x == -1 else ("╮" if x == self.width else "─"))
+                        + _R
+                    )
                 elif y == self.height:
-                    buf.append("╰" if x == -1 else ("╯" if x == self.width else "─"))
+                    buf.append(
+                        _B
+                        + ("╰" if x == -1 else ("╯" if x == self.width else "─"))
+                        + _R
+                    )
                 elif x == -1 or x == self.width:
-                    buf.append("│")
+                    buf.append(_B + "│" + _R)
                 else:
                     buf.append(" ")
 
@@ -427,7 +439,10 @@ class Canvas:
             result = type(default)(raw) if default is not None else raw
         except Exception:
             result = default
-        self.clear_line(input_row)
+        # Erase everything from the input row downward (handles any wrap length)
+        self.set_cursor_position(self._position_x, input_row)
+        sys.stdout.write("\u001b[J")
+        sys.stdout.flush()
         self.hide_cursor()
         return result
 
@@ -462,6 +477,10 @@ class AppState:
 
     lock: threading.Lock = field(default_factory=threading.Lock)
     running: bool = True
+    scroll_offset: int = 0
+    """Lines scrolled up from the bottom (0 = newest content visible)."""
+    show_thinking: bool = False
+    """When True, expand the think box to show full thought process."""
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -541,12 +560,12 @@ class OllamaWorker:
                 self._state.pending_updates = extract_files(output)
                 self._state.current_output = ""
                 self._state.think_output = ""
+                self._state.scroll_offset = 0
                 # think_duration is intentionally kept so the renderer can show "thought for X s"
                 self._state.model_busy = False
+                messages_snapshot = list(self._state.messages)
 
-            _send_notification(
-                _MODEL, (output[:40] + "…") if len(output) > 40 else output
-            )
+            _summarize_and_notify(_MODEL, messages_snapshot)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -568,7 +587,7 @@ def _wrap_lines(text: str, width: int) -> List[str]:
     return result
 
 
-def _shimmer_line(text: str, tick: int, speed: float = 0.4, band: int = 10) -> str:
+def _shimmer_line(text: str, tick: int, speed: float = 0.2, band: int = 10) -> str:
     """Return a markup string for *text* with a left-to-right shimmer sweep.
 
     A bright band travels across the full line width every ~3 s at the default
@@ -604,6 +623,270 @@ def _shimmer_line(text: str, tick: int, speed: float = 0.4, band: int = 10) -> s
     return "".join(out)
 
 
+# ── Syntax highlighting ────────────────────────────────────────────────────────
+
+_SH_KW: dict = {
+    "python": {
+        "False",
+        "None",
+        "True",
+        "and",
+        "as",
+        "assert",
+        "async",
+        "await",
+        "break",
+        "class",
+        "continue",
+        "def",
+        "del",
+        "elif",
+        "else",
+        "except",
+        "finally",
+        "for",
+        "from",
+        "global",
+        "if",
+        "import",
+        "in",
+        "is",
+        "lambda",
+        "nonlocal",
+        "not",
+        "or",
+        "pass",
+        "raise",
+        "return",
+        "try",
+        "while",
+        "with",
+        "yield",
+    },
+    "c": {
+        "auto",
+        "break",
+        "case",
+        "char",
+        "const",
+        "continue",
+        "default",
+        "do",
+        "double",
+        "else",
+        "enum",
+        "extern",
+        "float",
+        "for",
+        "goto",
+        "if",
+        "inline",
+        "int",
+        "long",
+        "register",
+        "return",
+        "short",
+        "signed",
+        "sizeof",
+        "static",
+        "struct",
+        "switch",
+        "typedef",
+        "union",
+        "unsigned",
+        "void",
+        "while",
+        "NULL",
+        "true",
+        "false",
+    },
+    "js": {
+        "async",
+        "await",
+        "break",
+        "case",
+        "catch",
+        "class",
+        "const",
+        "continue",
+        "debugger",
+        "default",
+        "delete",
+        "do",
+        "else",
+        "export",
+        "extends",
+        "false",
+        "finally",
+        "for",
+        "function",
+        "if",
+        "import",
+        "in",
+        "instanceof",
+        "let",
+        "new",
+        "null",
+        "return",
+        "super",
+        "switch",
+        "this",
+        "throw",
+        "true",
+        "try",
+        "typeof",
+        "undefined",
+        "var",
+        "void",
+        "while",
+        "with",
+        "yield",
+    },
+    "sh": {
+        "if",
+        "then",
+        "else",
+        "elif",
+        "fi",
+        "for",
+        "do",
+        "done",
+        "while",
+        "until",
+        "case",
+        "esac",
+        "function",
+        "return",
+        "echo",
+        "export",
+        "source",
+        "alias",
+        "local",
+        "readonly",
+        "declare",
+        "unset",
+        "shift",
+        "exit",
+    },
+}
+_SH_KW["py"] = _SH_KW["python"]
+_SH_KW["cpp"] = _SH_KW["c"]
+_SH_KW["javascript"] = _SH_KW["js"]
+_SH_KW["typescript"] = _SH_KW["js"]
+_SH_KW["ts"] = _SH_KW["js"]
+_SH_KW["bash"] = _SH_KW["sh"]
+_SH_KW["zsh"] = _SH_KW["sh"]
+
+_CH_DEFAULT = "%reset%color(185,185,185)"
+_CH_KW = "%reset%color(140,120,210)"
+_CH_STR = "%reset%color(180,160,80)"
+_CH_NUM = "%reset%color(210,130,80)"
+_CH_COMMENT = "%reset%color(105,120,85)"
+_CH_GUTTER = "%color(55,55,70)"
+
+
+def _highlight_line(line: str, lang: str) -> str:
+    """Return a markup string for one raw line of code."""
+    kw = _SH_KW.get(lang.lower(), set())
+    out: List[str] = [_CH_DEFAULT]
+    i, n = 0, len(line)
+
+    while i < n:
+        ch = line[i]
+
+        # Line comments: #  //  --
+        if ch == "#" or line[i : i + 2] in ("//", "--"):
+            out.append(_CH_COMMENT + line[i:])
+            break
+
+        # String literals (single/double quote, triple quotes)
+        if ch in ('"', "'"):
+            q = line[i : i + 3] if line[i : i + 3] in ('"""', "'''") else ch
+            j = i + len(q)
+            while j < n:
+                if line[j] == "\\":
+                    j += 2
+                    continue
+                if line[j : j + len(q)] == q:
+                    j += len(q)
+                    break
+                j += 1
+            out += [_CH_STR, line[i:j], _CH_DEFAULT]
+            i = j
+            continue
+
+        # Numbers
+        if ch.isdigit():
+            j = i + 1
+            while j < n and (line[j].isdigit() or line[j] in ".xXabcdefABCDEF_"):
+                j += 1
+            out += [_CH_NUM, line[i:j], _CH_DEFAULT]
+            i = j
+            continue
+
+        # Identifiers / keywords
+        if ch.isalpha() or ch == "_":
+            j = i + 1
+            while j < n and (line[j].isalnum() or line[j] == "_"):
+                j += 1
+            word = line[i:j]
+            if word in kw:
+                out += [_CH_KW, word, _CH_DEFAULT]
+            else:
+                out.append(word)
+            i = j
+            continue
+
+        out.append(ch)
+        i += 1
+
+    return "".join(out)
+
+
+def _split_code_blocks(content: str):
+    """Yield (is_code, lang, text) tuples, handling unclosed fences."""
+    fence = "```"
+    i = 0
+    while i < len(content):
+        fi = content.find(fence, i)
+        if fi == -1:
+            yield (False, "", content[i:])
+            break
+        if fi > i:
+            yield (False, "", content[i:fi])
+        nl = content.find("\n", fi + 3)
+        lang = content[fi + 3 : nl].strip() if nl != -1 else ""
+        start = (nl + 1) if nl != -1 else (fi + 3)
+        ci = content.find(fence, start)
+        if ci == -1:
+            yield (True, lang, content[start:])
+            i = len(content)
+        else:
+            yield (True, lang, content[start:ci])
+            i = ci + 3
+
+
+def _message_lines(content: str, width: int) -> List[str]:
+    """Convert assistant message text to display lines with code highlighting."""
+    lines: List[str] = []
+    code_w = max(width - 2, 10)
+
+    for is_code, lang, text in _split_code_blocks(content):
+        if is_code:
+            for raw in text.rstrip("\n").split("\n"):
+                while len(raw) > code_w:
+                    lines.append(
+                        _CH_GUTTER + "▌ " + _highlight_line(raw[:code_w], lang)
+                    )
+                    raw = raw[code_w:]
+                lines.append(_CH_GUTTER + "▌ " + _highlight_line(raw, lang))
+        else:
+            for line in _wrap_lines(text, width):
+                lines.append(line)
+
+    return lines
+
+
 def render_frame(canvas: Canvas, state: AppState, tick: int) -> None:
     """Build one frame inside *canvas* from the current *state*."""
     W = canvas.width
@@ -621,6 +904,8 @@ def render_frame(canvas: Canvas, state: AppState, tick: int) -> None:
         think_text = state.think_output
         think_dur = state.think_duration
         busy = state.model_busy
+        scroll = state.scroll_offset
+        show_thinking = state.show_thinking
 
     username = getpass.getuser()
 
@@ -648,12 +933,14 @@ def render_frame(canvas: Canvas, state: AppState, tick: int) -> None:
             secs = f"{think_dur:.1f}"
             all_lines.append((1, f"%color(80,80,80)│ thought for {secs}s."))
 
-        content_lines = _wrap_lines(msg["content"], USER_W if is_user else CONTENT_W)
-        for i, line in enumerate(content_lines):
-            if is_user:
+        if is_user:
+            content_lines = _wrap_lines(msg["content"], USER_W)
+            for line in content_lines:
+                line = line.strip()
                 line_x = max(W - 3 - len(line), USER_ZONE_START)
                 all_lines.append((line_x, "%color(120,180,255)" + line))
-            else:
+        else:
+            for line in _message_lines(msg["content"], CONTENT_W):
                 all_lines.append((1, line))
 
         all_lines.append((1, ""))  # blank line between turns
@@ -661,19 +948,42 @@ def render_frame(canvas: Canvas, state: AppState, tick: int) -> None:
     # In-progress assistant reply (streaming)
     if current:
         all_lines.append((1, "%color(70,70,70)" + _MODEL))
-        content_lines = _wrap_lines(current, CONTENT_W)
-        for i, line in enumerate(content_lines):
+        for line in _message_lines(current, CONTENT_W):
             all_lines.append((1, line))
 
-    # ── Layout: when thinking reserve rows for the think block ────────────
-    if busy:
-        visible_rows = STATUS_ROW - THINK_ROWS
-    else:
-        visible_rows = STATUS_ROW
+    # ── Pre-compute think block size so chat layout can avoid it ─────────
+    think_rows_reserved = 0
+    think_lines_expanded: List[str] = []
 
-    display_lines = (
-        all_lines[-visible_rows:] if len(all_lines) > visible_rows else all_lines
-    )
+    if busy and think_text:
+        clean = re.sub(r"</?think>", "", think_text)
+        if show_thinking:
+            raw_lines: List[str] = []
+            for raw in clean.split("\n"):
+                for wrapped in _wrap_lines(raw.strip(), W - 6) if raw.strip() else [""]:
+                    raw_lines.append(wrapped)
+            # Drop leading blank lines so no gap appears between label and content
+            while raw_lines and raw_lines[0].strip() == "":
+                raw_lines.pop(0)
+            # +1 for the label line at the top of the block
+            think_rows_reserved = min(len(raw_lines) + 1, H - 4)
+            think_lines_expanded = raw_lines
+        else:
+            think_rows_reserved = THINK_ROWS
+
+    # ── Layout: reserve rows for think block + status bar ─────────────────
+    visible_rows = STATUS_ROW - think_rows_reserved
+
+    total = len(all_lines)
+    if total > visible_rows:
+        max_scroll = total - visible_rows
+        scroll = min(scroll, max_scroll)
+        end = total - scroll
+        start = max(0, end - visible_rows)
+        display_lines = all_lines[start:end]
+    else:
+        scroll = 0
+        display_lines = all_lines
 
     # Bottom-align (Discord-style)
     start_y = max(0, visible_rows - len(display_lines))
@@ -682,25 +992,49 @@ def render_frame(canvas: Canvas, state: AppState, tick: int) -> None:
 
     # ── Status bar ─────────────────────────────────────────────────────────
     if busy:
-        spin = _SPINNER[tick % len(_SPINNER)]
+        spin = _SPINNER[(tick // 4) % len(_SPINNER)]
         status = f"%color(210,120,40){spin}%reset " + _shimmer_line("thinking…", tick)
         canvas.text(1, STATUS_ROW, status)
+    elif scroll > 0:
+        indicator = "↑ scrolled  ↓ return  ↵ type"
+        ind_x = max(0, (W - len(indicator)) // 2)
+        canvas.text(ind_x, STATUS_ROW, "%color(70,70,90)" + indicator)
     else:
-        ready_text = "ready — type below"
-        ready_x = max(0, (W - len(ready_text)) // 2)
-        canvas.text(ready_x, STATUS_ROW, "%color(80,80,80)" + ready_text)
+        hint = "↑↓ scroll   ↵ type"
+        hint_x = max(0, (W - len(hint)) // 2)
+        canvas.text(hint_x, STATUS_ROW, "%color(65,65,65)" + hint)
 
-    # ── Live think lines (only while busy) — fills bottom-to-top ──────────
+    # ── Think block rendering ──────────────────────────────────────────────
     if busy and think_text:
         clean = re.sub(r"</?think>", "", think_text)
-        flat = " ".join(clean.split())
-        # W - 6: 1 left (x=1) + "│ " prefix (2) + 1 right margin + 2 border = 6
-        think_display = _wrap_lines(flat, W - 6)[-THINK_ROWS:]
-        base_row = STATUS_ROW - 1
-        n = len(think_display)
-        for i, tl in enumerate(think_display):
-            row = base_row - (n - 1 - i)
-            canvas.text(1, row, "%color(80,80,80)│%reset %color(100,100,100)" + tl)
+        if show_thinking:
+            # Label occupies the first row of the reserved block, lines fill the rest
+            display_rows = think_rows_reserved - 1  # rows available for content
+            content = think_lines_expanded[-display_rows:] if display_rows > 0 else []
+            # Strip any leading blank lines from what we're about to render
+            while content and content[0].strip() == "":
+                content = content[1:]
+            block_start = STATUS_ROW - think_rows_reserved
+
+            # Label row — no gap between label and lines
+            canvas.text(1, block_start, "%color(55,55,75)  o · collapse thinking")
+
+            for i, tl in enumerate(content):
+                canvas.text(
+                    1,
+                    block_start + 1 + i,
+                    "%color(80,80,80)│%reset %color(100,100,100)" + tl.strip(),
+                )
+        else:
+            flat = " ".join(clean.split())
+            think_display = _wrap_lines(flat, W - 6)[-THINK_ROWS:]
+            base_row = STATUS_ROW - 1
+            n = len(think_display)
+            for i, tl in enumerate(think_display):
+                row = base_row - (n - 1 - i)
+                canvas.text(
+                    1, row, "%color(80,80,80)│%reset %color(100,100,100)" + tl.strip()
+                )
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -800,11 +1134,37 @@ def generate_system_prompt(cwd: str) -> str:
 # ═══════════════════════════════════════════════════════════════════════════════
 
 
-def _send_notification(title: str, message: str) -> None:
-    threading.Thread(
-        target=lambda: notification.notify(title=title, message=message, timeout=5),  # type: ignore
-        daemon=True,
-    ).start()
+def _summarize_and_notify(title: str, messages: List[dict]) -> None:
+    """Generate a one-sentence summary of the conversation, then notify."""
+
+    def _run() -> None:
+        try:
+            resp = ollama.chat(
+                _MODEL,
+                messages=[
+                    {
+                        "role": "system",
+                        "content": (
+                            "Summarize the assistant's last reply in one short sentence "
+                            "(under 80 chars). Reply with ONLY the summary — no preamble, "
+                            "no thinking, no punctuation at the end."
+                        ),
+                    },
+                    *messages[-6:],
+                ],
+                stream=False,
+                options={"num_predict": 60, "temperature": 0},
+            )
+            summary = resp.message.content or ""
+            summary = re.sub(
+                r"<think>.*?</think>", "", summary, flags=re.DOTALL
+            ).strip()
+            summary = summary[:80]
+        except Exception:
+            summary = "Response received."
+        notification.notify(title=title, message=summary, timeout=5)  # type: ignore
+
+    threading.Thread(target=_run, daemon=True).start()
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -826,63 +1186,125 @@ def main(argv: Tuple[str, ...]) -> None:
     canvas = Canvas(tw, th - 8)
 
     tick = 0
+    _SCROLL_STEP = 3
+    _prompt_requested = threading.Event()
 
-    while state.running:
-        # ── Handle terminal resize ─────────────────────────────────────────
-        size = os.get_terminal_size()
-        if size.columns != tw or size.lines != th:
-            tw, th = size.columns, size.lines
-            canvas.resize(tw, th - 8)
-
-        # ── Render current frame ───────────────────────────────────────────
-        render_frame(canvas, state, tick)
-        canvas.draw()
-        tick += 1
-
-        # ── While model is busy, just keep updating the display ────────────
-        if state.model_busy:
-            time.sleep(0.05)
-            continue
-
-        # ── Apply any pending file updates proposed by the model ───────────
+    def _on_key_press(key) -> None:
         with state.lock:
-            pending = dict(state.pending_updates)
-            state.pending_updates.clear()
+            if state.model_busy and key not in (_kb.Key.up, _kb.Key.down):
+                # Allow o-toggle even while busy
+                try:
+                    if key.char == "o":
+                        state.show_thinking = not state.show_thinking
+                except AttributeError:
+                    pass
+                return
+            if key == _kb.Key.up:
+                state.scroll_offset += _SCROLL_STEP
+            elif key == _kb.Key.down:
+                state.scroll_offset = max(0, state.scroll_offset - _SCROLL_STEP)
+            elif key == _kb.Key.space:
+                _prompt_requested.set()
+            else:
+                try:
+                    if key.char == "o":
+                        state.show_thinking = not state.show_thinking
+                except AttributeError:
+                    pass
 
-        for rel_path, content in pending.items():
-            abs_path = os.path.join(os.path.realpath(target_path), rel_path)
-            if not os.path.exists(abs_path):
-                canvas.text(
-                    0,
-                    canvas.height - 2,
-                    f"%color(255,100,100)Path not found: {abs_path}",
-                )
-                canvas.draw()
-                time.sleep(1.5)
+    listener = _kb.Listener(on_press=_on_key_press, suppress=True)
+    listener.start()
+
+    # Disable terminal echo so idle keypresses don't appear on screen
+    _fd = sys.stdin.fileno()
+    _old_term = termios.tcgetattr(_fd)
+    _noecho = termios.tcgetattr(_fd)
+    _noecho[3] &= ~termios.ECHO  # turn off ECHO flag
+    termios.tcsetattr(_fd, termios.TCSANOW, _noecho)
+
+    def _read_line_unsuppressed(prompt: str):
+        """Pause suppressing listener + restore echo, call read_line, then undo."""
+        nonlocal listener
+        listener.stop()
+        listener.join()
+        # Re-enable echo for the readline session
+        termios.tcsetattr(_fd, termios.TCSANOW, _old_term)
+        result = (canvas.read_line(prompt) or "").strip()
+        # Disable echo again and restart suppressing listener
+        termios.tcsetattr(_fd, termios.TCSANOW, _noecho)
+        listener = _kb.Listener(on_press=_on_key_press, suppress=True)
+        listener.start()
+        return result
+
+    try:
+        while state.running:
+            # ── Handle terminal resize ─────────────────────────────────────
+            size = os.get_terminal_size()
+            if size.columns != tw or size.lines != th:
+                tw, th = size.columns, size.lines
+                canvas.resize(tw, th - 8)
+
+            # ── Render frame ───────────────────────────────────────────────
+            render_frame(canvas, state, tick)
+            canvas.draw()
+            tick += 1
+
+            if state.model_busy:
+                time.sleep(0.05)
                 continue
-            answer = canvas.read_line(f"Write to ./{rel_path}? [Y/n]: ")
-            if (answer or "").strip().lower() not in ("n", "no"):
-                with open(abs_path, "w", encoding="utf-8") as fh:
-                    fh.write(content)
 
-        # ── Read user input (only reached when model is idle) ──────────────
-        user_input = (canvas.read_line("> ") or "").strip()
+            # ── Apply any pending file updates ─────────────────────────────
+            with state.lock:
+                pending = dict(state.pending_updates)
+                state.pending_updates.clear()
 
-        if user_input.lower() in ("bye", "quit", "exit", ""):
-            state.running = False
-            break
+            for rel_path, content in pending.items():
+                abs_path = os.path.join(os.path.realpath(target_path), rel_path)
+                if not os.path.exists(abs_path):
+                    canvas.text(
+                        0,
+                        canvas.height - 2,
+                        f"%color(255,100,100)Path not found: {abs_path}",
+                    )
+                    canvas.draw()
+                    time.sleep(1.5)
+                    continue
+                answer = _read_line_unsuppressed(f"Write to ./{rel_path}? [Y/n]: ")
+                if answer.lower() not in ("n", "no"):
+                    with open(abs_path, "w", encoding="utf-8") as fh:
+                        fh.write(content)
 
-        # ── Dispatch to Ollama on a background thread ──────────────────────
-        with state.lock:
-            state.messages.append({"role": "user", "content": user_input})
-            messages_snapshot = list(state.messages)
-            state.model_busy = True
-            state.current_output = ""
+            # ── Wait for space, then read input via read_line ──────────────
+            if not _prompt_requested.is_set():
+                time.sleep(0.016)
+                continue
 
-        system_prompt = generate_system_prompt(target_path)
-        worker.start(messages_snapshot, system_prompt)
+            _prompt_requested.clear()
+            user_input = _read_line_unsuppressed("> ")
+            with state.lock:
+                state.scroll_offset = 0
 
-    canvas.reset_console()
+            if not user_input:
+                continue  # just exit prompt mode, don't quit
+
+            if user_input.lower() in ("bye", "quit", "exit"):
+                state.running = False
+                break
+
+            # ── Dispatch to Ollama ─────────────────────────────────────────
+            with state.lock:
+                state.messages.append({"role": "user", "content": user_input})
+                messages_snapshot = list(state.messages)
+                state.model_busy = True
+                state.current_output = ""
+
+            system_prompt = generate_system_prompt(target_path)
+            worker.start(messages_snapshot, system_prompt)
+
+    finally:
+        termios.tcsetattr(_fd, termios.TCSANOW, _old_term)
+        listener.stop()
+        canvas.reset_console()
 
 
 if __name__ == "__main__":
