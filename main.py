@@ -27,7 +27,7 @@ import time
 from dataclasses import dataclass, field
 from enum import Enum, auto
 from pathlib import Path
-from typing import List, Optional, Tuple
+from typing import Any, List, Optional, Tuple
 
 import ollama
 from plyer import notification
@@ -308,7 +308,7 @@ class Canvas:
         self._cache_buffer = Symbol.buffer(self.width, self.height)
         self._frame_buffer = Symbol.buffer(self.width, self.height)
 
-        _B = "\u001b[38;2;55;55;65m"  # muted blue-gray
+        _B = "\u001b[38;2;55;55;65m"   # muted blue-gray
         _R = "\u001b[0m"
         buf: List[str] = []
         for y in range(-1, self.height + 1):
@@ -317,17 +317,9 @@ class Canvas:
                 row = self._position_y + y
                 buf.append(f"\u001b[{row + 1};{col + 1}H")
                 if y == -1:
-                    buf.append(
-                        _B
-                        + ("╭" if x == -1 else ("╮" if x == self.width else "─"))
-                        + _R
-                    )
+                    buf.append(_B + ("╭" if x == -1 else ("╮" if x == self.width else "─")) + _R)
                 elif y == self.height:
-                    buf.append(
-                        _B
-                        + ("╰" if x == -1 else ("╯" if x == self.width else "─"))
-                        + _R
-                    )
+                    buf.append(_B + ("╰" if x == -1 else ("╯" if x == self.width else "─")) + _R)
                 elif x == -1 or x == self.width:
                     buf.append(_B + "│" + _R)
                 else:
@@ -476,9 +468,6 @@ class AppState:
     stop_requested: bool = False
     """Set to True by ESC to abort the current generation."""
 
-    pending_updates: dict = field(default_factory=dict)
-    """File paths → content proposed by the model via %update% blocks."""
-
     lock: threading.Lock = field(default_factory=threading.Lock)
     running: bool = True
     scroll_offset: int = 0
@@ -495,63 +484,314 @@ _SPINNER = ["·", "✻", "✽", "✶", "✳", "✢", "✳", "✶", "✽", "✻"]
 _MODEL = "qwen3:8b"
 
 
-class OllamaWorker:
-    """Streams an Ollama chat response on a background daemon thread,
-    writing tokens into AppState.current_output as they arrive."""
+_TOOLS = [
+    {
+        "type": "function",
+        "function": {
+            "name": "read_file",
+            "description": "Read the full contents of a file in the project directory.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string", "description": "Relative path from the project root."},
+                },
+                "required": ["path"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "write_file",
+            "description": "Overwrite an existing file with new content.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path":    {"type": "string", "description": "Relative path from the project root."},
+                    "content": {"type": "string", "description": "Full new content for the file."},
+                },
+                "required": ["path", "content"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "create_file",
+            "description": "Create a new file (fails if it already exists).",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path":    {"type": "string", "description": "Relative path from the project root."},
+                    "content": {"type": "string", "description": "Initial file content."},
+                },
+                "required": ["path", "content"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "delete_file",
+            "description": "Delete a file. The user will be asked to confirm before deletion.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string", "description": "Relative path from the project root."},
+                },
+                "required": ["path"],
+            },
+        },
+    },
+]
 
-    def __init__(self, state: AppState) -> None:
+
+def _safe_path(rel: str, root: Path) -> Optional[Path]:
+    """Resolve *rel* relative to *root* and ensure it stays inside *root*.
+    Returns None if the path escapes the root."""
+    try:
+        resolved = (root / rel).resolve()
+        resolved.relative_to(root)  # raises ValueError if outside
+        return resolved
+    except (ValueError, Exception):
+        return None
+
+
+class OllamaWorker:
+    """Streams an Ollama chat response on a background daemon thread.
+
+    Supports tool calls (read / write / create / delete file).
+    Delete requires user confirmation via a canvas prompt before executing.
+    """
+
+    def __init__(self, state: AppState, canvas, root: Path) -> None:
         self._state = state
+        self._canvas = canvas
+        self._root = root
 
     def start(self, messages: List[dict], system_prompt: str) -> None:
-        """Spawn a new daemon thread for the current request."""
         threading.Thread(
             target=self._run,
             args=(list(messages), system_prompt),
             daemon=True,
         ).start()
 
+    # ── Tool execution ───────────────────────────────────────────────────────
+
+    def _exec_tool(self, name: str, args: dict) -> str:
+        """Execute one tool call synchronously. Returns the result string."""
+        path = _safe_path(args.get("path", ""), self._root)
+        if path is None:
+            return "[ERROR] Path is outside the project directory."
+
+        if name == "read_file":
+            if not path.exists():
+                return f"[ERROR] File not found: {args['path']}"
+            try:
+                return path.read_text(encoding="utf-8")
+            except Exception as e:
+                return f"[ERROR] {e}"
+
+        elif name == "write_file":
+            if not path.exists():
+                return f"[ERROR] File does not exist (use create_file to make a new file): {args['path']}"
+            try:
+                path.write_text(args.get("content", ""), encoding="utf-8")
+                return f"OK: wrote {path.stat().st_size} bytes to {args['path']}"
+            except Exception as e:
+                return f"[ERROR] {e}"
+
+        elif name == "create_file":
+            if path.exists():
+                return f"[ERROR] File already exists: {args['path']}"
+            try:
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text(args.get("content", ""), encoding="utf-8")
+                return f"OK: created {args['path']}"
+            except Exception as e:
+                return f"[ERROR] {e}"
+
+        elif name == "delete_file":
+            if not path.exists():
+                return f"[ERROR] File not found: {args['path']}"
+            # Pause generation briefly to get user confirmation on the main thread.
+            # We communicate via a threading.Event + shared slot.
+            confirmed = self._confirm_delete(args["path"])
+            if confirmed:
+                try:
+                    path.unlink()
+                    return f"OK: deleted {args['path']}"
+                except Exception as e:
+                    return f"[ERROR] {e}"
+            else:
+                return "CANCELLED: user declined deletion."
+
+        return f"[ERROR] Unknown tool: {name}"
+
+    def _confirm_delete(self, rel: str) -> bool:
+        """Block the worker thread until the main thread confirms or denies."""
+        result_holder: List[Optional[bool]] = [None]
+        done = threading.Event()
+
+        def _ask():
+            import termios, tty as _tty
+            fd = sys.stdin.fileno()
+            cooked = termios.tcgetattr(fd)
+            termios.tcsetattr(fd, termios.TCSANOW, cooked)
+            answer = (self._canvas.read_line(f"Delete {rel}? [y/N]: ") or "").strip().lower()
+            # Restore cbreak
+            _tty.setcbreak(fd, termios.TCSANOW)
+            result_holder[0] = answer in ("y", "yes")
+            done.set()
+
+        threading.Thread(target=_ask, daemon=True).start()
+        done.wait()
+        return bool(result_holder[0])
+
+    # ── Main run loop ────────────────────────────────────────────────────────
+
     def _run(self, messages: List[dict], system_prompt: str) -> None:
+        import json as _json
+
         output = ""
         think_text = ""
         thinking = False
+        tool_messages: List[dict] = list(messages)
+
+        def _push_status(text: str) -> None:
+            with self._state.lock:
+                self._state.current_output = text
 
         try:
-            response = ollama.chat(
-                _MODEL,
-                [{"role": "system", "content": system_prompt}] + messages,
-                stream=True,
-            )
-
-            for token in response:
+            while True:
                 with self._state.lock:
                     if self._state.stop_requested:
                         break
-                content: str = token.message.content or ""
-                if not content:
-                    continue
 
-                if "<think>" in content:
-                    thinking = True
-                    with self._state.lock:
-                        self._state.think_start_time = time.time()
-                if "</think>" in content:
-                    thinking = False
-                    with self._state.lock:
-                        self._state.think_duration = (
-                            time.time() - self._state.think_start_time
-                        )
-                    continue
+                response = ollama.chat(
+                    _MODEL,
+                    [{"role": "system", "content": system_prompt}] + tool_messages,
+                    tools=_TOOLS,
+                    stream=True,
+                )
 
-                if thinking:
-                    # Accumulate think text and push last 3 lines to state
-                    think_text += content
+                # Accumulate the full streamed response to inspect for tool calls
+                full_content = ""
+                tool_calls_acc: List[Any] = []
+
+                for token in response:
+                    with self._state.lock:
+                        if self._state.stop_requested:
+                            break
+
+                    msg = token.message
+
+                    # Stream text tokens to the display
+                    chunk = msg.content or ""
+                    if chunk:
+                        if "<think>" in chunk:
+                            thinking = True
+                            with self._state.lock:
+                                self._state.think_start_time = time.time()
+                        if "</think>" in chunk:
+                            thinking = False
+                            with self._state.lock:
+                                self._state.think_duration = (
+                                    time.time() - self._state.think_start_time
+                                )
+                            chunk = re.sub(r".*</think>", "", chunk, flags=re.DOTALL)
+
+                        if thinking:
+                            think_text += chunk
+                            with self._state.lock:
+                                self._state.think_output = think_text
+                        else:
+                            full_content += chunk
+                            output = full_content
+                            with self._state.lock:
+                                self._state.current_output = full_content
+
+                    # Collect tool calls streamed in this token
+                    if hasattr(msg, "tool_calls") and msg.tool_calls:
+                        for tc in msg.tool_calls:
+                            tool_calls_acc.append(tc)
+
+                # If no tool calls, we're done
+                if not tool_calls_acc:
+                    break
+
+                # Deduplicate tool calls (streaming may repeat them) and serialize to dicts
+                seen: set = set()
+                unique_tcs: List[Any] = []
+                for tc in tool_calls_acc:
+                    key = (tc.function.name, str(tc.function.arguments))
+                    if key not in seen:
+                        seen.add(key)
+                        unique_tcs.append(tc)
+                tool_calls_acc = unique_tcs
+
+                # Serialize ToolCall objects → plain dicts for the message history
+                tc_dicts = []
+                for tc in tool_calls_acc:
+                    raw_args = tc.function.arguments
+                    if isinstance(raw_args, str):
+                        try:
+                            raw_args = _json.loads(raw_args)
+                        except Exception:
+                            raw_args = {}
+                    tc_dicts.append({
+                        "function": {"name": tc.function.name, "arguments": raw_args}
+                    })
+
+                tool_messages.append({
+                    "role": "assistant",
+                    "content": full_content,
+                    "tool_calls": tc_dicts,
+                })
+
+                for tc_d in tc_dicts:
+                    fn   = tc_d["function"]["name"]
+                    args = tc_d["function"]["arguments"]
+                    if isinstance(args, str):
+                        try:
+                            args = _json.loads(args)
+                        except Exception:
+                            args = {}
+
+                    rel = args.get("path", "")
+                    verb = {
+                        "read_file":   "reading",
+                        "write_file":  "writing",
+                        "create_file": "creating",
+                        "delete_file": "deleting",
+                    }.get(fn, fn)
+                    done_verb = {
+                        "read_file":   "read",
+                        "write_file":  "wrote",
+                        "create_file": "created",
+                        "delete_file": "deleted",
+                    }.get(fn, fn)
+                    pending_sentinel = f"\x00TOOL_PENDING\x00{verb} {rel}…"
+                    done_sentinel    = f"\x00TOOL_DONE\x00{done_verb} {rel}"
+
+                    # Inject pending marker into think stream
+                    with self._state.lock:
+                        self._state.think_output = think_text + f"\n{pending_sentinel}"
+
+                    result = self._exec_tool(fn, args)
+
+                    # Replace pending marker with done marker in place
+                    think_text += f"\n{done_sentinel}"
                     with self._state.lock:
                         self._state.think_output = think_text
-                    continue
 
-                output += content
-                with self._state.lock:
-                    self._state.current_output = output
+                    tool_messages.append({
+                        "role":    "tool",
+                        "content": result,
+                        "name":    fn,
+                    })
+
+                # Loop for the next model turn
 
         except Exception as exc:
             output = f"[ERROR] {exc}"
@@ -564,12 +804,10 @@ class OllamaWorker:
                     self._state.messages.append(
                         {"role": "assistant", "content": output}
                     )
-                self._state.pending_updates = extract_files(output)
                 self._state.current_output = ""
                 self._state.think_output = ""
                 self._state.scroll_offset = 0
                 self._state.stop_requested = False
-                # think_duration is intentionally kept so the renderer can show "thought for X s"
                 self._state.model_busy = False
                 messages_snapshot = list(self._state.messages)
 
@@ -634,369 +872,51 @@ def _shimmer_line(text: str, tick: int, speed: float = 0.2, band: int = 10) -> s
 # ── Syntax highlighting ────────────────────────────────────────────────────────
 
 _SH_KW: dict = {
-    "python": {
-        "False",
-        "None",
-        "True",
-        "and",
-        "as",
-        "assert",
-        "async",
-        "await",
-        "break",
-        "class",
-        "continue",
-        "def",
-        "del",
-        "elif",
-        "else",
-        "except",
-        "finally",
-        "for",
-        "from",
-        "global",
-        "if",
-        "import",
-        "in",
-        "is",
-        "lambda",
-        "nonlocal",
-        "not",
-        "or",
-        "pass",
-        "raise",
-        "return",
-        "try",
-        "while",
-        "with",
-        "yield",
-    },
-    "c": {
-        "auto",
-        "break",
-        "case",
-        "char",
-        "const",
-        "continue",
-        "default",
-        "do",
-        "double",
-        "else",
-        "enum",
-        "extern",
-        "float",
-        "for",
-        "goto",
-        "if",
-        "inline",
-        "int",
-        "long",
-        "register",
-        "return",
-        "short",
-        "signed",
-        "sizeof",
-        "static",
-        "struct",
-        "switch",
-        "typedef",
-        "union",
-        "unsigned",
-        "void",
-        "while",
-        "NULL",
-        "true",
-        "false",
-    },
-    "js": {
-        "async",
-        "await",
-        "break",
-        "case",
-        "catch",
-        "class",
-        "const",
-        "continue",
-        "debugger",
-        "default",
-        "delete",
-        "do",
-        "else",
-        "export",
-        "extends",
-        "false",
-        "finally",
-        "for",
-        "function",
-        "if",
-        "import",
-        "in",
-        "instanceof",
-        "let",
-        "new",
-        "null",
-        "return",
-        "super",
-        "switch",
-        "this",
-        "throw",
-        "true",
-        "try",
-        "typeof",
-        "undefined",
-        "var",
-        "void",
-        "while",
-        "with",
-        "yield",
-    },
-    "sh": {
-        "if",
-        "then",
-        "else",
-        "elif",
-        "fi",
-        "for",
-        "do",
-        "done",
-        "while",
-        "until",
-        "case",
-        "esac",
-        "function",
-        "return",
-        "echo",
-        "export",
-        "source",
-        "alias",
-        "local",
-        "readonly",
-        "declare",
-        "unset",
-        "shift",
-        "exit",
-    },
-    "zig": {
-        "addrspace",
-        "align",
-        "allowzero",
-        "and",
-        "anyframe",
-        "anytype",
-        "asm",
-        "async",
-        "await",
-        "break",
-        "callconv",
-        "catch",
-        "comptime",
-        "const",
-        "continue",
-        "defer",
-        "else",
-        "enum",
-        "errdefer",
-        "error",
-        "export",
-        "extern",
-        "fn",
-        "for",
-        "if",
-        "inline",
-        "linksection",
-        "noalias",
-        "nosuspend",
-        "noinline",
-        "opaque",
-        "or",
-        "orelse",
-        "packed",
-        "pub",
-        "resume",
-        "return",
-        "struct",
-        "suspend",
-        "switch",
-        "test",
-        "threadlocal",
-        "try",
-        "union",
-        "unreachable",
-        "usingnamespace",
-        "var",
-        "volatile",
-        "while",
-        "true",
-        "false",
-        "null",
-        "undefined",
-    },
-    "rust": {
-        "as",
-        "async",
-        "await",
-        "break",
-        "const",
-        "continue",
-        "crate",
-        "dyn",
-        "else",
-        "enum",
-        "extern",
-        "false",
-        "fn",
-        "for",
-        "if",
-        "impl",
-        "in",
-        "let",
-        "loop",
-        "match",
-        "mod",
-        "move",
-        "mut",
-        "pub",
-        "ref",
-        "return",
-        "self",
-        "Self",
-        "static",
-        "struct",
-        "super",
-        "trait",
-        "true",
-        "type",
-        "union",
-        "unsafe",
-        "use",
-        "where",
-        "while",
-        "abstract",
-        "become",
-        "box",
-        "do",
-        "final",
-        "macro",
-        "override",
-        "priv",
-        "try",
-        "typeof",
-        "unsized",
-        "virtual",
-        "yield",
-        "i8",
-        "i16",
-        "i32",
-        "i64",
-        "i128",
-        "isize",
-        "u8",
-        "u16",
-        "u32",
-        "u64",
-        "u128",
-        "usize",
-        "f32",
-        "f64",
-        "bool",
-        "char",
-        "str",
-        "String",
-        "Option",
-        "Result",
-        "Some",
-        "None",
-        "Ok",
-        "Err",
-        "Vec",
-        "Box",
-        "Arc",
-        "Rc",
-        "HashMap",
-    },
-    "php": {
-        "abstract",
-        "and",
-        "array",
-        "as",
-        "break",
-        "callable",
-        "case",
-        "catch",
-        "class",
-        "clone",
-        "const",
-        "continue",
-        "declare",
-        "default",
-        "do",
-        "echo",
-        "else",
-        "elseif",
-        "empty",
-        "enddeclare",
-        "endfor",
-        "endforeach",
-        "endif",
-        "endswitch",
-        "endwhile",
-        "enum",
-        "extends",
-        "final",
-        "finally",
-        "fn",
-        "for",
-        "foreach",
-        "function",
-        "global",
-        "goto",
-        "if",
-        "implements",
-        "include",
-        "include_once",
-        "instanceof",
-        "insteadof",
-        "interface",
-        "isset",
-        "list",
-        "match",
-        "namespace",
-        "new",
-        "or",
-        "print",
-        "private",
-        "protected",
-        "public",
-        "readonly",
-        "require",
-        "require_once",
-        "return",
-        "static",
-        "switch",
-        "throw",
-        "trait",
-        "try",
-        "unset",
-        "use",
-        "var",
-        "while",
-        "xor",
-        "yield",
-        "true",
-        "false",
-        "null",
-        "TRUE",
-        "FALSE",
-        "NULL",
-        "int",
-        "float",
-        "string",
-        "bool",
-        "void",
-        "array",
-        "object",
-        "mixed",
-    },
+    "python": {"False","None","True","and","as","assert","async","await","break",
+               "class","continue","def","del","elif","else","except","finally",
+               "for","from","global","if","import","in","is","lambda","nonlocal",
+               "not","or","pass","raise","return","try","while","with","yield"},
+    "c":      {"auto","break","case","char","const","continue","default","do",
+               "double","else","enum","extern","float","for","goto","if","inline",
+               "int","long","register","return","short","signed","sizeof","static",
+               "struct","switch","typedef","union","unsigned","void","while",
+               "NULL","true","false"},
+    "js":     {"async","await","break","case","catch","class","const","continue",
+               "debugger","default","delete","do","else","export","extends",
+               "false","finally","for","function","if","import","in","instanceof",
+               "let","new","null","return","super","switch","this","throw","true",
+               "try","typeof","undefined","var","void","while","with","yield"},
+    "sh":     {"if","then","else","elif","fi","for","do","done","while","until",
+               "case","esac","function","return","echo","export","source","alias",
+               "local","readonly","declare","unset","shift","exit"},
+    "zig":    {"addrspace","align","allowzero","and","anyframe","anytype","asm",
+               "async","await","break","callconv","catch","comptime","const",
+               "continue","defer","else","enum","errdefer","error","export",
+               "extern","fn","for","if","inline","linksection","noalias",
+               "nosuspend","noinline","opaque","or","orelse","packed","pub",
+               "resume","return","struct","suspend","switch","test","threadlocal",
+               "try","union","unreachable","usingnamespace","var","volatile","while",
+               "true","false","null","undefined"},
+    "rust":   {"as","async","await","break","const","continue","crate","dyn","else",
+               "enum","extern","false","fn","for","if","impl","in","let","loop",
+               "match","mod","move","mut","pub","ref","return","self","Self",
+               "static","struct","super","trait","true","type","union","unsafe",
+               "use","where","while","abstract","become","box","do","final",
+               "macro","override","priv","try","typeof","unsized","virtual","yield",
+               "i8","i16","i32","i64","i128","isize","u8","u16","u32","u64","u128",
+               "usize","f32","f64","bool","char","str","String","Option","Result",
+               "Some","None","Ok","Err","Vec","Box","Arc","Rc","HashMap"},
+    "php":    {"abstract","and","array","as","break","callable","case","catch",
+               "class","clone","const","continue","declare","default","do","echo",
+               "else","elseif","empty","enddeclare","endfor","endforeach","endif",
+               "endswitch","endwhile","enum","extends","final","finally","fn","for",
+               "foreach","function","global","goto","if","implements","include",
+               "include_once","instanceof","insteadof","interface","isset","list",
+               "match","namespace","new","or","print","private","protected","public",
+               "readonly","require","require_once","return","static","switch","throw",
+               "trait","try","unset","use","var","while","xor","yield",
+               "true","false","null","TRUE","FALSE","NULL",
+               "int","float","string","bool","void","array","object","mixed"},
 }
 _SH_KW["py"] = _SH_KW["python"]
 _SH_KW["cpp"] = _SH_KW["c"]
@@ -1007,11 +927,11 @@ _SH_KW["bash"] = _SH_KW["sh"]
 _SH_KW["zsh"] = _SH_KW["sh"]
 
 _CH_DEFAULT = "%reset%color(185,185,185)"
-_CH_KW = "%reset%color(140,120,210)"
-_CH_STR = "%reset%color(180,160,80)"
-_CH_NUM = "%reset%color(210,130,80)"
+_CH_KW      = "%reset%color(140,120,210)"
+_CH_STR     = "%reset%color(180,160,80)"
+_CH_NUM     = "%reset%color(210,130,80)"
 _CH_COMMENT = "%reset%color(105,120,85)"
-_CH_GUTTER = "%color(55,55,70)"
+_CH_GUTTER  = "%color(55,55,70)"
 
 
 def _highlight_line(line: str, lang: str) -> str:
@@ -1024,19 +944,19 @@ def _highlight_line(line: str, lang: str) -> str:
         ch = line[i]
 
         # Line comments: #  //  --
-        if ch == "#" or line[i : i + 2] in ("//", "--"):
+        if ch == "#" or line[i:i+2] in ("//", "--"):
             out.append(_CH_COMMENT + line[i:])
             break
 
         # String literals (single/double quote, triple quotes)
         if ch in ('"', "'"):
-            q = line[i : i + 3] if line[i : i + 3] in ('"""', "'''") else ch
+            q = line[i:i+3] if line[i:i+3] in ('"""', "'''") else ch
             j = i + len(q)
             while j < n:
-                if line[j] == "\\":
+                if line[j] == "\\" :
                     j += 2
                     continue
-                if line[j : j + len(q)] == q:
+                if line[j:j+len(q)] == q:
                     j += len(q)
                     break
                 j += 1
@@ -1084,7 +1004,7 @@ def _split_code_blocks(content: str):
         if fi > i:
             yield (False, "", content[i:fi])
         nl = content.find("\n", fi + 3)
-        lang = content[fi + 3 : nl].strip() if nl != -1 else ""
+        lang = content[fi + 3:nl].strip() if nl != -1 else ""
         start = (nl + 1) if nl != -1 else (fi + 3)
         ci = content.find(fence, start)
         if ci == -1:
@@ -1104,9 +1024,7 @@ def _message_lines(content: str, width: int) -> List[str]:
         if is_code:
             for raw in text.rstrip("\n").split("\n"):
                 while len(raw) > code_w:
-                    lines.append(
-                        _CH_GUTTER + "▌ " + _highlight_line(raw[:code_w], lang)
-                    )
+                    lines.append(_CH_GUTTER + "▌ " + _highlight_line(raw[:code_w], lang))
                     raw = raw[code_w:]
                 lines.append(_CH_GUTTER + "▌ " + _highlight_line(raw, lang))
         else:
@@ -1182,23 +1100,32 @@ def render_frame(canvas: Canvas, state: AppState, tick: int) -> None:
 
     # ── Pre-compute think block size so chat layout can avoid it ─────────
     think_rows_reserved = 0
-    think_lines_expanded: List[str] = []
+    think_lines_expanded: List[Tuple[str, str]] = []  # (kind, text): kind ∈ "text","pending","done"
 
-    if busy and think_text:
+    _has_think_block = busy and bool(think_text)
+
+    if _has_think_block:
         clean = re.sub(r"</?think>", "", think_text)
+        raw: List[Tuple[str, str]] = []
+        for line in clean.split("\n"):
+            if line.startswith("\x00TOOL_PENDING\x00"):
+                raw.append(("pending", line[len("\x00TOOL_PENDING\x00"):]))
+            elif line.startswith("\x00TOOL_DONE\x00"):
+                raw.append(("done", line[len("\x00TOOL_DONE\x00"):]))
+            else:
+                for wrapped in (_wrap_lines(line.strip(), W - 6) if line.strip() else [""]):
+                    raw.append(("text", wrapped))
+
+        # Drop leading blank text lines
+        while raw and raw[0] == ("text", ""):
+            raw.pop(0)
+
+        think_lines_expanded = raw
+
         if show_thinking:
-            raw_lines: List[str] = []
-            for raw in clean.split("\n"):
-                for wrapped in _wrap_lines(raw.strip(), W - 6) if raw.strip() else [""]:
-                    raw_lines.append(wrapped)
-            # Drop leading blank lines so no gap appears between label and content
-            while raw_lines and raw_lines[0].strip() == "":
-                raw_lines.pop(0)
-            # +1 for the label line at the top of the block
-            think_rows_reserved = min(len(raw_lines) + 1, H - 4)
-            think_lines_expanded = raw_lines
+            think_rows_reserved = min(len(raw) + 1, H - 4)  # +1 for header
         else:
-            think_rows_reserved = THINK_ROWS
+            think_rows_reserved = min(THINK_ROWS, len(raw)) if raw else 0
 
     # ── Layout: reserve rows for think block + status bar ─────────────────
     visible_rows = STATUS_ROW - think_rows_reserved
@@ -1234,46 +1161,39 @@ def render_frame(canvas: Canvas, state: AppState, tick: int) -> None:
         canvas.text(hint_x, STATUS_ROW, "%color(65,65,65)" + hint)
 
     # ── Think block rendering ──────────────────────────────────────────────
-    if busy and think_text:
-        clean = re.sub(r"</?think>", "", think_text)
+    if _has_think_block and think_lines_expanded:
+
+        def _render_think_line(kind: str, text: str) -> str:
+            if kind == "pending":
+                return "%color(160,140,60)◎%reset %color(150,140,100)" + text
+            if kind == "done":
+                return "%color(70,160,100)✔%reset %color(100,120,100)" + text
+            return "%color(100,100,100)" + text
+
         if show_thinking:
-            # Label occupies the first row of the reserved block, lines fill the rest
-            display_rows = think_rows_reserved - 1  # rows available for content
+            display_rows = think_rows_reserved - 1
             content = think_lines_expanded[-display_rows:] if display_rows > 0 else []
-            # Strip any leading blank lines from what we're about to render
-            while content and content[0].strip() == "":
+            while content and content[0] == ("text", ""):
                 content = content[1:]
             block_start = STATUS_ROW - think_rows_reserved
 
-            # Label row — no gap between label and lines
             canvas.text(1, block_start, "%color(55,55,75)  o · collapse thinking")
-
-            for i, tl in enumerate(content):
-                canvas.text(
-                    1,
-                    block_start + 1 + i,
-                    "%color(80,80,80)│%reset %color(100,100,100)" + tl.strip(),
-                )
+            for i, (kind, text) in enumerate(content):
+                canvas.text(1, block_start + 1 + i,
+                            "%color(80,80,80)│%reset " + _render_think_line(kind, text))
         else:
-            flat = " ".join(clean.split())
-            think_display = _wrap_lines(flat, W - 6)[-THINK_ROWS:]
+            pool = think_lines_expanded[-think_rows_reserved:]
             base_row = STATUS_ROW - 1
-            n = len(think_display)
-            for i, tl in enumerate(think_display):
+            n = len(pool)
+            for i, (kind, text) in enumerate(pool):
                 row = base_row - (n - 1 - i)
-                canvas.text(
-                    1, row, "%color(80,80,80)│%reset %color(100,100,100)" + tl.strip()
-                )
+                canvas.text(1, row,
+                            "%color(80,80,80)│%reset " + _render_think_line(kind, text))
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # Filesystem / prompt helpers
 # ═══════════════════════════════════════════════════════════════════════════════
-
-
-def extract_files(markdown: str) -> dict:
-    pattern = r"%update%\s+(\S+)\s*\n```[^\n]*\n(.*?)```"
-    return {path: content for path, content in re.findall(pattern, markdown, re.DOTALL)}
 
 
 def _load_ignore_patterns(root: Path) -> List[str]:
@@ -1318,43 +1238,22 @@ def _generate_tree(
     return built
 
 
-def _gather_file_contents(root: Path, patterns: List[str]) -> str:
-    parts = ["## File Contents:"]
-    for fp in root.rglob("*"):
-        if fp.is_file() and not _is_ignored(fp, root, patterns):
-            try:
-                content = fp.read_text(encoding="utf-8")
-                parts.append(f"Contents of `{fp.relative_to(root)}`:")
-                parts.append(f"```\n{content.strip()}\n```\n")
-            except (UnicodeDecodeError, PermissionError):
-                continue
-    return "\n".join(parts)
-
-
 def generate_system_prompt(cwd: str) -> str:
     path = Path(cwd).resolve()
     patterns = _load_ignore_patterns(path)
 
     prompt = "# Project Information\n"
-    prompt += "> Refer to the following when answering the user's prompt.\n\n"
+    prompt += f"> Working directory: `{path}`\n\n"
     prompt += "## Directory File Structure:\n```\n"
     prompt += _generate_tree(path, path, patterns)
     prompt += "```\n\n"
-    prompt += _gather_file_contents(path, patterns)
-    prompt += "\n# Guidelines\n"
+    prompt += "# Guidelines\n"
+    prompt += "- Use the provided file tools to read files before editing them.\n"
+    prompt += "- Only operate on files within the working directory shown above.\n"
     prompt += "- Look up language specs for the correct version when writing code.\n"
-    prompt += "- Triple-check gathered information before responding.\n"
     prompt += "- Follow the style of the user's existing code.\n"
-    prompt += "- Cite sources and be accurate.\n"
-    prompt += "\n## File Changes\n"
-    prompt += (
-        "To modify a file use **exactly** this syntax (full file contents only):\n"
-    )
-    prompt += "%update% <filepath>\n```<code>```\n"
-    prompt += "Always rewrite the complete file — no partial changes.\n"
-    prompt += "\n## Response Style\n"
-    prompt += "Keep replies concise. Only point out non-obvious issues.\n"
-    prompt += "Do not overthink simple tasks.\n"
+    prompt += "- Keep replies concise. Only point out non-obvious issues.\n"
+    prompt += "- Do not overthink simple tasks.\n"
     return prompt
 
 
@@ -1365,7 +1264,6 @@ def generate_system_prompt(cwd: str) -> str:
 
 def _summarize_and_notify(title: str, messages: List[dict]) -> None:
     """Generate a one-sentence summary of the conversation, then notify."""
-
     def _run() -> None:
         try:
             resp = ollama.chat(
@@ -1385,9 +1283,7 @@ def _summarize_and_notify(title: str, messages: List[dict]) -> None:
                 options={"num_predict": 60, "temperature": 0},
             )
             summary = resp.message.content or ""
-            summary = re.sub(
-                r"<think>.*?</think>", "", summary, flags=re.DOTALL
-            ).strip()
+            summary = re.sub(r"<think>.*?</think>", "", summary, flags=re.DOTALL).strip()
             summary = summary[:80]
         except Exception:
             summary = "Response received."
@@ -1408,11 +1304,12 @@ def main(argv: Tuple[str, ...]) -> None:
 
     target_path = argv[1]
     state = AppState()
-    worker = OllamaWorker(state)
+    root = Path(target_path).resolve()
 
     tw = os.get_terminal_size().columns
     th = os.get_terminal_size().lines
     canvas = Canvas(tw, th - 8)
+    worker = OllamaWorker(state, canvas, root)
 
     tick = 0
     _SCROLL_STEP = 3
@@ -1481,41 +1378,16 @@ def main(argv: Tuple[str, ...]) -> None:
                 if state.model_busy:
                     continue  # swallow all other keys while model is running
 
-                if key == "\x1b[A":  # ↑
+                if key == "\x1b[A":   # ↑
                     with state.lock:
                         state.scroll_offset += _SCROLL_STEP
-                elif key == "\x1b[B":  # ↓
+                elif key == "\x1b[B": # ↓
                     with state.lock:
                         state.scroll_offset = max(0, state.scroll_offset - _SCROLL_STEP)
-                elif key == " ":  # space → enter prompt mode
-                    # ── Apply any pending file updates ─────────────────────
-                    with state.lock:
-                        pending = dict(state.pending_updates)
-                        state.pending_updates.clear()
-
-                    for rel_path, content in pending.items():
-                        abs_path = os.path.join(os.path.realpath(target_path), rel_path)
-                        if not os.path.exists(abs_path):
-                            canvas.text(
-                                0,
-                                canvas.height - 2,
-                                f"%color(255,100,100)Path not found: {abs_path}",
-                            )
-                            canvas.draw()
-                            time.sleep(1.5)
-                            continue
-                        _leave_cbreak()
-                        answer = (
-                            canvas.read_line(f"Write to ./{rel_path}? [Y/n]: ") or ""
-                        ).strip()
-                        _enter_cbreak()
-                        if answer.lower() not in ("n", "no"):
-                            with open(abs_path, "w", encoding="utf-8") as fh:
-                                fh.write(content)
-
+                elif key == " ":      # space → enter prompt mode
                     # ── Read user prompt ───────────────────────────────────
                     _leave_cbreak()
-                    raw_input = canvas.read_line("> ") or ""
+                    raw_input = (canvas.read_line("> ") or "")
                     _enter_cbreak()
 
                     with state.lock:
@@ -1540,7 +1412,7 @@ def main(argv: Tuple[str, ...]) -> None:
                         state.model_busy = True
                         state.current_output = ""
 
-                    system_prompt = generate_system_prompt(target_path)
+                    system_prompt = generate_system_prompt(str(root))
                     worker.start(messages_snapshot, system_prompt)
 
             time.sleep(0.016)
