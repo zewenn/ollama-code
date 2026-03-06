@@ -31,7 +31,8 @@ from typing import List, Optional, Tuple
 
 import ollama
 from plyer import notification
-from pynput import keyboard as _kb
+import select
+import tty
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -472,6 +473,9 @@ class AppState:
     model_busy: bool = False
     """True while the Ollama thread is running — blocks user input."""
 
+    stop_requested: bool = False
+    """Set to True by ESC to abort the current generation."""
+
     pending_updates: dict = field(default_factory=dict)
     """File paths → content proposed by the model via %update% blocks."""
 
@@ -519,6 +523,9 @@ class OllamaWorker:
             )
 
             for token in response:
+                with self._state.lock:
+                    if self._state.stop_requested:
+                        break
                 content: str = token.message.content or ""
                 if not content:
                     continue
@@ -561,6 +568,7 @@ class OllamaWorker:
                 self._state.current_output = ""
                 self._state.think_output = ""
                 self._state.scroll_offset = 0
+                self._state.stop_requested = False
                 # think_duration is intentionally kept so the renderer can show "thought for X s"
                 self._state.model_busy = False
                 messages_snapshot = list(self._state.messages)
@@ -767,6 +775,227 @@ _SH_KW: dict = {
         "unset",
         "shift",
         "exit",
+    },
+    "zig": {
+        "addrspace",
+        "align",
+        "allowzero",
+        "and",
+        "anyframe",
+        "anytype",
+        "asm",
+        "async",
+        "await",
+        "break",
+        "callconv",
+        "catch",
+        "comptime",
+        "const",
+        "continue",
+        "defer",
+        "else",
+        "enum",
+        "errdefer",
+        "error",
+        "export",
+        "extern",
+        "fn",
+        "for",
+        "if",
+        "inline",
+        "linksection",
+        "noalias",
+        "nosuspend",
+        "noinline",
+        "opaque",
+        "or",
+        "orelse",
+        "packed",
+        "pub",
+        "resume",
+        "return",
+        "struct",
+        "suspend",
+        "switch",
+        "test",
+        "threadlocal",
+        "try",
+        "union",
+        "unreachable",
+        "usingnamespace",
+        "var",
+        "volatile",
+        "while",
+        "true",
+        "false",
+        "null",
+        "undefined",
+    },
+    "rust": {
+        "as",
+        "async",
+        "await",
+        "break",
+        "const",
+        "continue",
+        "crate",
+        "dyn",
+        "else",
+        "enum",
+        "extern",
+        "false",
+        "fn",
+        "for",
+        "if",
+        "impl",
+        "in",
+        "let",
+        "loop",
+        "match",
+        "mod",
+        "move",
+        "mut",
+        "pub",
+        "ref",
+        "return",
+        "self",
+        "Self",
+        "static",
+        "struct",
+        "super",
+        "trait",
+        "true",
+        "type",
+        "union",
+        "unsafe",
+        "use",
+        "where",
+        "while",
+        "abstract",
+        "become",
+        "box",
+        "do",
+        "final",
+        "macro",
+        "override",
+        "priv",
+        "try",
+        "typeof",
+        "unsized",
+        "virtual",
+        "yield",
+        "i8",
+        "i16",
+        "i32",
+        "i64",
+        "i128",
+        "isize",
+        "u8",
+        "u16",
+        "u32",
+        "u64",
+        "u128",
+        "usize",
+        "f32",
+        "f64",
+        "bool",
+        "char",
+        "str",
+        "String",
+        "Option",
+        "Result",
+        "Some",
+        "None",
+        "Ok",
+        "Err",
+        "Vec",
+        "Box",
+        "Arc",
+        "Rc",
+        "HashMap",
+    },
+    "php": {
+        "abstract",
+        "and",
+        "array",
+        "as",
+        "break",
+        "callable",
+        "case",
+        "catch",
+        "class",
+        "clone",
+        "const",
+        "continue",
+        "declare",
+        "default",
+        "do",
+        "echo",
+        "else",
+        "elseif",
+        "empty",
+        "enddeclare",
+        "endfor",
+        "endforeach",
+        "endif",
+        "endswitch",
+        "endwhile",
+        "enum",
+        "extends",
+        "final",
+        "finally",
+        "fn",
+        "for",
+        "foreach",
+        "function",
+        "global",
+        "goto",
+        "if",
+        "implements",
+        "include",
+        "include_once",
+        "instanceof",
+        "insteadof",
+        "interface",
+        "isset",
+        "list",
+        "match",
+        "namespace",
+        "new",
+        "or",
+        "print",
+        "private",
+        "protected",
+        "public",
+        "readonly",
+        "require",
+        "require_once",
+        "return",
+        "static",
+        "switch",
+        "throw",
+        "trait",
+        "try",
+        "unset",
+        "use",
+        "var",
+        "while",
+        "xor",
+        "yield",
+        "true",
+        "false",
+        "null",
+        "TRUE",
+        "FALSE",
+        "NULL",
+        "int",
+        "float",
+        "string",
+        "bool",
+        "void",
+        "array",
+        "object",
+        "mixed",
     },
 }
 _SH_KW["py"] = _SH_KW["python"]
@@ -996,11 +1225,11 @@ def render_frame(canvas: Canvas, state: AppState, tick: int) -> None:
         status = f"%color(210,120,40){spin}%reset " + _shimmer_line("thinking…", tick)
         canvas.text(1, STATUS_ROW, status)
     elif scroll > 0:
-        indicator = "↑ scrolled  ↓ return  ↵ type"
+        indicator = "↑↓ scroll   ␣ type"
         ind_x = max(0, (W - len(indicator)) // 2)
         canvas.text(ind_x, STATUS_ROW, "%color(70,70,90)" + indicator)
     else:
-        hint = "↑↓ scroll   ↵ type"
+        hint = "↑↓ scroll   ␣ type"
         hint_x = max(0, (W - len(hint)) // 2)
         canvas.text(hint_x, STATUS_ROW, "%color(65,65,65)" + hint)
 
@@ -1187,54 +1416,34 @@ def main(argv: Tuple[str, ...]) -> None:
 
     tick = 0
     _SCROLL_STEP = 3
-    _prompt_requested = threading.Event()
-
-    def _on_key_press(key) -> None:
-        with state.lock:
-            if state.model_busy and key not in (_kb.Key.up, _kb.Key.down):
-                # Allow o-toggle even while busy
-                try:
-                    if key.char == "o":
-                        state.show_thinking = not state.show_thinking
-                except AttributeError:
-                    pass
-                return
-            if key == _kb.Key.up:
-                state.scroll_offset += _SCROLL_STEP
-            elif key == _kb.Key.down:
-                state.scroll_offset = max(0, state.scroll_offset - _SCROLL_STEP)
-            elif key == _kb.Key.space:
-                _prompt_requested.set()
-            else:
-                try:
-                    if key.char == "o":
-                        state.show_thinking = not state.show_thinking
-                except AttributeError:
-                    pass
-
-    listener = _kb.Listener(on_press=_on_key_press, suppress=True)
-    listener.start()
-
-    # Disable terminal echo so idle keypresses don't appear on screen
     _fd = sys.stdin.fileno()
-    _old_term = termios.tcgetattr(_fd)
-    _noecho = termios.tcgetattr(_fd)
-    _noecho[3] &= ~termios.ECHO  # turn off ECHO flag
-    termios.tcsetattr(_fd, termios.TCSANOW, _noecho)
 
-    def _read_line_unsuppressed(prompt: str):
-        """Pause suppressing listener + restore echo, call read_line, then undo."""
-        nonlocal listener
-        listener.stop()
-        listener.join()
-        # Re-enable echo for the readline session
-        termios.tcsetattr(_fd, termios.TCSANOW, _old_term)
-        result = (canvas.read_line(prompt) or "").strip()
-        # Disable echo again and restart suppressing listener
-        termios.tcsetattr(_fd, termios.TCSANOW, _noecho)
-        listener = _kb.Listener(on_press=_on_key_press, suppress=True)
-        listener.start()
-        return result
+    # Save original terminal settings so we can restore them and use them
+    # for read_line (which needs normal cooked/echo mode).
+    _cooked = termios.tcgetattr(_fd)
+
+    def _key_available() -> bool:
+        """Return True if a keypress is waiting on stdin (non-blocking)."""
+        return bool(select.select([_fd], [], [], 0)[0])
+
+    def _read_key() -> str:
+        """Read one key or escape sequence from stdin (assumes cbreak mode)."""
+        ch = os.read(_fd, 1)
+        if ch == b"\x1b":
+            # Escape sequence: read remainder with a short deadline
+            if select.select([_fd], [], [], 0.05)[0]:
+                ch += os.read(_fd, 8)
+        return ch.decode("utf-8", errors="replace")
+
+    def _enter_cbreak() -> None:
+        """Switch stdin to cbreak (no echo, characters available immediately)."""
+        tty.setcbreak(_fd, termios.TCSANOW)
+
+    def _leave_cbreak() -> None:
+        """Restore stdin to cooked mode with echo for read_line."""
+        termios.tcsetattr(_fd, termios.TCSANOW, _cooked)
+
+    _enter_cbreak()
 
     try:
         while state.running:
@@ -1249,61 +1458,95 @@ def main(argv: Tuple[str, ...]) -> None:
             canvas.draw()
             tick += 1
 
-            if state.model_busy:
-                time.sleep(0.05)
-                continue
+            # ── Drain all pending keypresses from stdin ────────────────────
+            while _key_available():
+                key = _read_key()
 
-            # ── Apply any pending file updates ─────────────────────────────
-            with state.lock:
-                pending = dict(state.pending_updates)
-                state.pending_updates.clear()
-
-            for rel_path, content in pending.items():
-                abs_path = os.path.join(os.path.realpath(target_path), rel_path)
-                if not os.path.exists(abs_path):
-                    canvas.text(
-                        0,
-                        canvas.height - 2,
-                        f"%color(255,100,100)Path not found: {abs_path}",
-                    )
-                    canvas.draw()
-                    time.sleep(1.5)
+                # ESC — context-sensitive
+                if key == "\x1b":
+                    if state.model_busy:
+                        with state.lock:
+                            state.stop_requested = True
+                    else:
+                        state.running = False
+                        break
                     continue
-                answer = _read_line_unsuppressed(f"Write to ./{rel_path}? [Y/n]: ")
-                if answer.lower() not in ("n", "no"):
-                    with open(abs_path, "w", encoding="utf-8") as fh:
-                        fh.write(content)
 
-            # ── Wait for space, then read input via read_line ──────────────
-            if not _prompt_requested.is_set():
-                time.sleep(0.016)
-                continue
+                # o — toggle thinking view (works even while busy)
+                if key == "o":
+                    with state.lock:
+                        state.show_thinking = not state.show_thinking
+                    continue
 
-            _prompt_requested.clear()
-            user_input = _read_line_unsuppressed("> ")
-            with state.lock:
-                state.scroll_offset = 0
+                if state.model_busy:
+                    continue  # swallow all other keys while model is running
 
-            if not user_input:
-                continue  # just exit prompt mode, don't quit
+                if key == "\x1b[A":  # ↑
+                    with state.lock:
+                        state.scroll_offset += _SCROLL_STEP
+                elif key == "\x1b[B":  # ↓
+                    with state.lock:
+                        state.scroll_offset = max(0, state.scroll_offset - _SCROLL_STEP)
+                elif key == " ":  # space → enter prompt mode
+                    # ── Apply any pending file updates ─────────────────────
+                    with state.lock:
+                        pending = dict(state.pending_updates)
+                        state.pending_updates.clear()
 
-            if user_input.lower() in ("bye", "quit", "exit"):
-                state.running = False
-                break
+                    for rel_path, content in pending.items():
+                        abs_path = os.path.join(os.path.realpath(target_path), rel_path)
+                        if not os.path.exists(abs_path):
+                            canvas.text(
+                                0,
+                                canvas.height - 2,
+                                f"%color(255,100,100)Path not found: {abs_path}",
+                            )
+                            canvas.draw()
+                            time.sleep(1.5)
+                            continue
+                        _leave_cbreak()
+                        answer = (
+                            canvas.read_line(f"Write to ./{rel_path}? [Y/n]: ") or ""
+                        ).strip()
+                        _enter_cbreak()
+                        if answer.lower() not in ("n", "no"):
+                            with open(abs_path, "w", encoding="utf-8") as fh:
+                                fh.write(content)
 
-            # ── Dispatch to Ollama ─────────────────────────────────────────
-            with state.lock:
-                state.messages.append({"role": "user", "content": user_input})
-                messages_snapshot = list(state.messages)
-                state.model_busy = True
-                state.current_output = ""
+                    # ── Read user prompt ───────────────────────────────────
+                    _leave_cbreak()
+                    raw_input = canvas.read_line("> ") or ""
+                    _enter_cbreak()
 
-            system_prompt = generate_system_prompt(target_path)
-            worker.start(messages_snapshot, system_prompt)
+                    with state.lock:
+                        state.scroll_offset = 0
+
+                    # ESC in cooked mode arrives as a literal \x1b in the string
+                    if "\x1b" in raw_input:
+                        continue  # cancelled — exit prompt mode silently
+
+                    user_input = raw_input.strip()
+
+                    if not user_input:
+                        continue  # exit prompt mode, don't quit
+
+                    if user_input.lower() in ("bye", "quit", "exit"):
+                        state.running = False
+                        break
+
+                    with state.lock:
+                        state.messages.append({"role": "user", "content": user_input})
+                        messages_snapshot = list(state.messages)
+                        state.model_busy = True
+                        state.current_output = ""
+
+                    system_prompt = generate_system_prompt(target_path)
+                    worker.start(messages_snapshot, system_prompt)
+
+            time.sleep(0.016)
 
     finally:
-        termios.tcsetattr(_fd, termios.TCSANOW, _old_term)
-        listener.stop()
+        _leave_cbreak()
         canvas.reset_console()
 
 
