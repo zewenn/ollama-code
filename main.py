@@ -30,9 +30,60 @@ from pathlib import Path
 from typing import Any, List, Optional, Tuple
 
 import ollama
+from bs4 import BeautifulSoup
+from duckduckgo_search import DDGS
 from plyer import notification
+import requests
 import select
+import subprocess
 import tty
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Theme  — all colour definitions in one place
+# ═══════════════════════════════════════════════════════════════════════════════
+
+
+class Theme:
+    """Central colour palette.  Change values here to restyle the entire UI."""
+
+    # ── Chat ──────────────────────────────────────────────────────────────────
+    USER_TEXT = "%color(120,180,255)"  # user bubble text
+    USER_HEADER = "%color(70,70,70)"  # username / model name label
+    ASST_THOUGHT = "%color(80,80,80)"  # "thought for Xs." line
+    ASST_HEADER = "%color(70,70,70)"  # model name label
+
+    # ── Think block ───────────────────────────────────────────────────────────
+    THINK_GUTTER = "%color(80,80,80)"  # │ prefix
+    THINK_TEXT = "%color(100,100,100)"  # plain thinking text
+    THINK_HEADER = "%color(55,55,75)"  # "o · collapse thinking" label
+    THINK_PENDING = "%color(160,140,60)"  # ◎ symbol colour
+    THINK_PENDING_T = "%color(150,140,100)"  # pending label text
+    THINK_DONE = "%color(70,160,100)"  # ✔ symbol colour
+    THINK_DONE_T = "%color(100,120,100)"  # done label text
+    THINK_ERROR = "%color(210,70,70)"  # ✘ symbol + error label
+
+    # ── Status bar ────────────────────────────────────────────────────────────
+    SPIN = "%color(210,120,40)"  # spinner colour
+    HINT = "%color(65,65,65)"  # idle hint text
+    HINT_SCROLL = "%color(70,70,90)"  # scroll-mode hint text
+
+    # ── Diff stats (tool done line) ───────────────────────────────────────────
+    DIFF_ADD = "%color(80,180,100)"  # +N added lines
+    DIFF_DEL = "%color(200,80,80)"  # -N removed lines
+    DIFF_NEUTRAL = "%color(90,90,90)"  # line count / neutral stat
+
+    # ── Syntax highlighting ───────────────────────────────────────────────────
+    SYN_DEFAULT = "%reset%color(185,185,185)"
+    SYN_KEYWORD = "%reset%color(140,120,210)"
+    SYN_STRING = "%reset%color(180,160,80)"
+    SYN_NUMBER = "%reset%color(210,130,80)"
+    SYN_COMMENT = "%reset%color(105,120,85)"
+    SYN_GUTTER = "%color(55,55,70)"
+
+    # ── Canvas border ─────────────────────────────────────────────────────────
+    BORDER = "\u001b[38;2;55;55;65m"  # raw ANSI — used before markup engine
+    BORDER_RESET = "\u001b[0m"
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -308,8 +359,8 @@ class Canvas:
         self._cache_buffer = Symbol.buffer(self.width, self.height)
         self._frame_buffer = Symbol.buffer(self.width, self.height)
 
-        _B = "\u001b[38;2;55;55;65m"   # muted blue-gray
-        _R = "\u001b[0m"
+        _B = Theme.BORDER
+        _R = Theme.BORDER_RESET
         buf: List[str] = []
         for y in range(-1, self.height + 1):
             for x in range(-1, self.width + 1):
@@ -317,9 +368,17 @@ class Canvas:
                 row = self._position_y + y
                 buf.append(f"\u001b[{row + 1};{col + 1}H")
                 if y == -1:
-                    buf.append(_B + ("╭" if x == -1 else ("╮" if x == self.width else "─")) + _R)
+                    buf.append(
+                        _B
+                        + ("╭" if x == -1 else ("╮" if x == self.width else "─"))
+                        + _R
+                    )
                 elif y == self.height:
-                    buf.append(_B + ("╰" if x == -1 else ("╯" if x == self.width else "─")) + _R)
+                    buf.append(
+                        _B
+                        + ("╰" if x == -1 else ("╯" if x == self.width else "─"))
+                        + _R
+                    )
                 elif x == -1 or x == self.width:
                     buf.append(_B + "│" + _R)
                 else:
@@ -468,6 +527,15 @@ class AppState:
     stop_requested: bool = False
     """Set to True by ESC to abort the current generation."""
 
+    last_turn_tools: List[Tuple[str, bool]] = field(default_factory=list)
+    """Tool calls from the last completed turn: (label, done). Shown below 'thought for' line."""
+
+    think_scroll: int = 0
+    """Lines scrolled up inside the expanded think box."""
+
+    think_label: str = "thinking…"
+    """Dynamic status label updated by the background label-generator thread."""
+
     lock: threading.Lock = field(default_factory=threading.Lock)
     running: bool = True
     scroll_offset: int = 0
@@ -493,7 +561,10 @@ _TOOLS = [
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "path": {"type": "string", "description": "Relative path from the project root."},
+                    "path": {
+                        "type": "string",
+                        "description": "Relative path from the project root.",
+                    },
                 },
                 "required": ["path"],
             },
@@ -507,8 +578,14 @@ _TOOLS = [
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "path":    {"type": "string", "description": "Relative path from the project root."},
-                    "content": {"type": "string", "description": "Full new content for the file."},
+                    "path": {
+                        "type": "string",
+                        "description": "Relative path from the project root.",
+                    },
+                    "content": {
+                        "type": "string",
+                        "description": "Full new content for the file.",
+                    },
                 },
                 "required": ["path", "content"],
             },
@@ -522,8 +599,14 @@ _TOOLS = [
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "path":    {"type": "string", "description": "Relative path from the project root."},
-                    "content": {"type": "string", "description": "Initial file content."},
+                    "path": {
+                        "type": "string",
+                        "description": "Relative path from the project root.",
+                    },
+                    "content": {
+                        "type": "string",
+                        "description": "Initial file content.",
+                    },
                 },
                 "required": ["path", "content"],
             },
@@ -537,13 +620,158 @@ _TOOLS = [
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "path": {"type": "string", "description": "Relative path from the project root."},
+                    "path": {
+                        "type": "string",
+                        "description": "Relative path from the project root.",
+                    },
                 },
                 "required": ["path"],
             },
         },
     },
+    {
+        "type": "function",
+        "function": {
+            "name": "web_search",
+            "description": (
+                "Search the web for up-to-date information. "
+                "Fetches the top 2 results, extracts relevant content, and returns a summary. "
+                "Use this for anything requiring current knowledge, documentation, or external facts."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": {"type": "string", "description": "The search query."},
+                },
+                "required": ["query"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "consult_critic",
+            "description": (
+                "Submit your current plan or implementation to a cold, adversarial critic for review. "
+                "The critic will find flaws, edge cases, wrong assumptions, and logical errors — "
+                "things you might have missed. Use this when you are about to commit to an approach "
+                "on a complex task, or when a previous attempt failed. "
+                "Pass your full plan or the relevant code/reasoning as the argument."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "plan": {
+                        "type": "string",
+                        "description": "Your current plan, reasoning, or implementation draft to be critiqued.",
+                    },
+                },
+                "required": ["plan"],
+            },
+        },
+    },
 ]
+
+
+def _web_search(query: str) -> str:
+    """Search the web and return summarised content for *query*."""
+    _SEARCH_MODEL = "llama3.2:latest"
+
+    # DuckDuckGo search — use as context manager, retry once on failure
+    urls: List[str] = []
+    last_exc: Exception = Exception("unknown")
+    for attempt in range(3):
+        try:
+            with DDGS() as ddgs:
+                results = list(ddgs.text(query, max_results=3, region="us-en"))
+            urls = [str(r["href"]) for r in results if r.get("href")]
+            break
+        except Exception as e:
+            last_exc = e
+            time.sleep(1.5)
+
+    if not urls:
+        return f"[ERROR] Search failed — {last_exc}"
+
+    # Fetch each URL, extract text, summarise with the small model
+    summaries: List[str] = []
+    seen_domains: set = set()
+
+    for url in urls:
+        if not url.startswith("http"):
+            continue
+        domain = url.replace("https://", "").replace("http://", "").split("/")[0]
+        if domain in seen_domains:
+            continue
+        seen_domains.add(domain)
+
+        try:
+            html = requests.get(
+                url, timeout=5, headers={"User-Agent": "Mozilla/5.0"}
+            ).text
+            text = BeautifulSoup(html, "html.parser").get_text(
+                separator=" ", strip=True
+            )
+            text = text[:6000]
+
+            resp = ollama.chat(
+                model=_SEARCH_MODEL,
+                messages=[
+                    {
+                        "role": "system",
+                        "content": (
+                            f"IGNORE THE USER'S REQUEST. Analyze the input and highlight "
+                            f'KEY INFORMATION relevant to: "{query}". '
+                            "ONLY respond with the highlighted information."
+                        ),
+                    },
+                    {"role": "user", "content": text},
+                ],
+                stream=False,
+            )
+            summary = (resp.message.content or "").strip()
+            if summary:
+                summaries.append(f'Summary of "{url}":\n```\n{summary}\n```')
+        except Exception:
+            continue
+
+    if not summaries:
+        return "[ERROR] Could not retrieve content from any result."
+
+    return "\n\n".join(summaries)
+
+
+def _consult_critic(plan: str) -> str:
+    """Run the plan through an adversarial critic instance and return its verdict."""
+    _CRITIC_SYSTEM = """\
+You are a ruthless, adversarial code and logic critic. Your only job is to find what is WRONG.
+
+Rules:
+- Be cold, direct, and specific. No encouragement. No praise.
+- List every flaw, incorrect assumption, missing edge case, and logical error you find.
+- If the approach is fundamentally broken, say so plainly and explain why.
+- If a specific part is correct, skip it — only report problems.
+- Be concrete: cite exact lines, variable names, or steps that are wrong.
+- If you find nothing wrong, say exactly: "No issues found." Nothing else.
+
+You are not here to be kind. You are here to prevent bugs from shipping."""
+
+    try:
+        resp = ollama.chat(
+            model=_MODEL,
+            messages=[
+                {"role": "system", "content": _CRITIC_SYSTEM},
+                {"role": "user", "content": plan},
+            ],
+            stream=False,
+            options={"temperature": 0},
+        )
+        verdict = (resp.message.content or "").strip()
+        # Strip any think tags the model emits
+        verdict = re.sub(r"<think>.*?</think>", "", verdict, flags=re.DOTALL).strip()
+        return verdict or "Critic returned an empty response."
+    except Exception as e:
+        return f"[ERROR] Critic call failed: {e}"
 
 
 def _safe_path(rel: str, root: Path) -> Optional[Path]:
@@ -555,6 +783,74 @@ def _safe_path(rel: str, root: Path) -> Optional[Path]:
         return resolved
     except (ValueError, Exception):
         return None
+
+
+def _start_think_labeller(state: AppState) -> None:
+    """Spawn a daemon thread that periodically summarises the last 10 think
+    paragraphs into a short label and writes it to state.think_label.
+
+    Polls every ~2 s, debounces on content change, calls llama3.2 at
+    temperature 0 to produce a 4-8 word present-tense phrase.
+    Stops automatically when model_busy becomes False."""
+
+    _LABEL_MODEL = "llama3.2:latest"
+    _POLL_INTERVAL = 2.0
+    _MIN_CHARS = 80
+
+    _SYSTEM = (
+        "You are a concise status-line generator. "
+        "The user will paste raw thinking text from an AI reasoning trace. "
+        "Reply with a single short phrase (4-8 words, present tense, lowercase) "
+        "describing what the AI is currently working on — e.g. "
+        "'parsing operator precedence rules' or 'checking edge cases for division'. "
+        "Output ONLY that phrase. No punctuation at the end. Nothing else."
+    )
+
+    def _run() -> None:
+        last_snapshot = ""
+        while True:
+            time.sleep(_POLL_INTERVAL)
+
+            with state.lock:
+                if not state.model_busy:
+                    state.think_label = "thinking…"
+                    break
+                raw = state.think_output
+
+            # Strip tags and tool sentinels, keep plain text
+            clean = re.sub(r"</?think>", "", raw)
+            clean = re.sub(r"\x00TOOL_(?:PENDING|DONE)\x00[^\n]*", "", clean)
+
+            # Last 10 non-empty paragraphs
+            paras = [p.strip() for p in re.split(r"\n{2,}", clean) if p.strip()]
+            excerpt = "\n\n".join(paras[-10:])
+
+            if len(excerpt) < _MIN_CHARS or excerpt == last_snapshot:
+                continue
+            last_snapshot = excerpt
+
+            try:
+                resp = ollama.chat(
+                    model=_LABEL_MODEL,
+                    messages=[
+                        {"role": "system", "content": _SYSTEM},
+                        {"role": "user", "content": excerpt},
+                    ],
+                    stream=False,
+                    options={"num_predict": 20, "temperature": 0},
+                )
+                label = (resp.message.content or "").strip()
+                label = re.sub(
+                    r"<think>.*?</think>", "", label, flags=re.DOTALL
+                ).strip()
+                label = label.rstrip(".,;")
+                if label:
+                    with state.lock:
+                        state.think_label = label + "…"
+            except Exception:
+                pass  # keep previous label on error
+
+    threading.Thread(target=_run, daemon=True).start()
 
 
 class OllamaWorker:
@@ -626,6 +922,18 @@ class OllamaWorker:
             else:
                 return "CANCELLED: user declined deletion."
 
+        elif name == "web_search":
+            query = args.get("query", "").strip()
+            if not query:
+                return "[ERROR] No query provided."
+            return _web_search(query)
+
+        elif name == "consult_critic":
+            plan = args.get("plan", "").strip()
+            if not plan:
+                return "[ERROR] No plan provided."
+            return _consult_critic(plan)
+
         return f"[ERROR] Unknown tool: {name}"
 
     def _confirm_delete(self, rel: str) -> bool:
@@ -635,10 +943,13 @@ class OllamaWorker:
 
         def _ask():
             import termios, tty as _tty
+
             fd = sys.stdin.fileno()
             cooked = termios.tcgetattr(fd)
             termios.tcsetattr(fd, termios.TCSANOW, cooked)
-            answer = (self._canvas.read_line(f"Delete {rel}? [y/N]: ") or "").strip().lower()
+            answer = (
+                (self._canvas.read_line(f"Delete {rel}? [y/N]: ") or "").strip().lower()
+            )
             # Restore cbreak
             _tty.setcbreak(fd, termios.TCSANOW)
             result_holder[0] = answer in ("y", "yes")
@@ -657,6 +968,9 @@ class OllamaWorker:
         think_text = ""
         thinking = False
         tool_messages: List[dict] = list(messages)
+
+        with self._state.lock:
+            self._state.last_turn_tools = []
 
         def _push_status(text: str) -> None:
             with self._state.lock:
@@ -739,18 +1053,20 @@ class OllamaWorker:
                             raw_args = _json.loads(raw_args)
                         except Exception:
                             raw_args = {}
-                    tc_dicts.append({
-                        "function": {"name": tc.function.name, "arguments": raw_args}
-                    })
+                    tc_dicts.append(
+                        {"function": {"name": tc.function.name, "arguments": raw_args}}
+                    )
 
-                tool_messages.append({
-                    "role": "assistant",
-                    "content": full_content,
-                    "tool_calls": tc_dicts,
-                })
+                tool_messages.append(
+                    {
+                        "role": "assistant",
+                        "content": full_content,
+                        "tool_calls": tc_dicts,
+                    }
+                )
 
                 for tc_d in tc_dicts:
-                    fn   = tc_d["function"]["name"]
+                    fn = tc_d["function"]["name"]
                     args = tc_d["function"]["arguments"]
                     if isinstance(args, str):
                         try:
@@ -758,21 +1074,39 @@ class OllamaWorker:
                         except Exception:
                             args = {}
 
-                    rel = args.get("path", "")
                     verb = {
-                        "read_file":   "reading",
-                        "write_file":  "writing",
+                        "read_file": "reading",
+                        "write_file": "writing",
                         "create_file": "creating",
                         "delete_file": "deleting",
+                        "web_search": "searching",
+                        "consult_critic": "consulting critic",
                     }.get(fn, fn)
                     done_verb = {
-                        "read_file":   "read",
-                        "write_file":  "wrote",
+                        "read_file": "read",
+                        "write_file": "wrote",
                         "create_file": "created",
                         "delete_file": "deleted",
+                        "web_search": "searched",
+                        "consult_critic": "critic reviewed",
                     }.get(fn, fn)
+                    rel = args.get("path", "") or args.get("query", "")
                     pending_sentinel = f"\x00TOOL_PENDING\x00{verb} {rel}…"
-                    done_sentinel    = f"\x00TOOL_DONE\x00{done_verb} {rel}"
+
+                    # Snapshot line count before mutation for diff display
+                    _diff_str = ""
+                    if fn in ("write_file", "create_file", "delete_file", "read_file"):
+                        _fpath = _safe_path(args.get("path", ""), self._root)
+                        try:
+                            _before = (
+                                len(_fpath.read_text(encoding="utf-8").splitlines())
+                                if _fpath and _fpath.exists()
+                                else 0
+                            )
+                        except Exception:
+                            _before = 0
+                    else:
+                        _before = None
 
                     # Inject pending marker into think stream
                     with self._state.lock:
@@ -780,18 +1114,77 @@ class OllamaWorker:
 
                     result = self._exec_tool(fn, args)
 
-                    # Replace pending marker with done marker in place
-                    think_text += f"\n{done_sentinel}"
+                    # Compute diff stat after exec
+                    if _before is not None:
+                        _fpath2 = _safe_path(args.get("path", ""), self._root)
+                        try:
+                            _after = (
+                                len(_fpath2.read_text(encoding="utf-8").splitlines())
+                                if _fpath2 and _fpath2.exists()
+                                else 0
+                            )
+                        except Exception:
+                            _after = 0
+                        _added = max(0, _after - _before)
+                        _removed = max(0, _before - _after)
+                        if fn == "read_file":
+                            _diff_str = f"  {_before}L"
+                        elif fn == "delete_file" and _removed > 0:
+                            _diff_str = f"  -{_removed}"
+                        elif _added > 0 or _removed > 0:
+                            parts = []
+                            if _added:
+                                parts.append(f"+{_added}")
+                            if _removed:
+                                parts.append(f"-{_removed}")
+                            _diff_str = "  " + " ".join(parts)
+
+                    done_sentinel = f"\x00TOOL_DONE\x00{done_verb} {rel}{_diff_str}"
+                    error_sentinel = f"\x00TOOL_ERROR\x00{done_verb} {rel}"
+
+                    # Replace pending marker with done/error marker in place
+                    is_error = result.startswith("[ERROR]")
+                    sentinel = error_sentinel if is_error else done_sentinel
+                    think_text += f"\n{sentinel}\n"
                     with self._state.lock:
                         self._state.think_output = think_text
+                        if not is_error:
+                            self._state.last_turn_tools.append(
+                                (f"{done_verb} {rel}{_diff_str}", True)
+                            )
 
-                    tool_messages.append({
-                        "role":    "tool",
-                        "content": result,
-                        "name":    fn,
-                    })
+                    tool_messages.append(
+                        {
+                            "role": "tool",
+                            "content": result,
+                            "name": fn,
+                        }
+                    )
 
-                # Loop for the next model turn
+                # Loop for the next model turn.
+                # Inject the prior reasoning so the model continues rather than restarts.
+                clean_prior = re.sub(r"</?think>", "", think_text)
+                clean_prior = re.sub(
+                    r"\x00TOOL_(?:PENDING|DONE)\x00[^\n]*", "", clean_prior
+                )
+                clean_prior = clean_prior.strip()
+                if clean_prior:
+                    tool_messages.append(
+                        {
+                            "role": "user",
+                            "content": (
+                                "**YOU ARE IN THE MIDDLE OF THINKING**\n"
+                                "HERE ARE YOUR PREVIOUS THOUGHTS:\n"
+                                f"<prior_thinking>\n{clean_prior}\n</prior_thinking>\n\n"
+                                "The tool results are above. "
+                                "Check if your task has been achieved by the previous tool usage, if yes **STOP THINKING**. "
+                                "Continue your reasoning from where you left off. "
+                                "DO NOT restart from step 1. DO NOT re-read files you already read. "
+                                "Use what you already know and proceed directly to the next step. "
+                                "MAKE SURE TO CHECK IF YOU HAVE EXECUTED A TOOL BEFORE, DO NOT REPEAT YOURSELF!!!"
+                            ),
+                        }
+                    )
 
         except Exception as exc:
             output = f"[ERROR] {exc}"
@@ -806,6 +1199,7 @@ class OllamaWorker:
                     )
                 self._state.current_output = ""
                 self._state.think_output = ""
+                self._state.think_label = "thinking…"
                 self._state.scroll_offset = 0
                 self._state.stop_requested = False
                 self._state.model_busy = False
@@ -872,51 +1266,369 @@ def _shimmer_line(text: str, tick: int, speed: float = 0.2, band: int = 10) -> s
 # ── Syntax highlighting ────────────────────────────────────────────────────────
 
 _SH_KW: dict = {
-    "python": {"False","None","True","and","as","assert","async","await","break",
-               "class","continue","def","del","elif","else","except","finally",
-               "for","from","global","if","import","in","is","lambda","nonlocal",
-               "not","or","pass","raise","return","try","while","with","yield"},
-    "c":      {"auto","break","case","char","const","continue","default","do",
-               "double","else","enum","extern","float","for","goto","if","inline",
-               "int","long","register","return","short","signed","sizeof","static",
-               "struct","switch","typedef","union","unsigned","void","while",
-               "NULL","true","false"},
-    "js":     {"async","await","break","case","catch","class","const","continue",
-               "debugger","default","delete","do","else","export","extends",
-               "false","finally","for","function","if","import","in","instanceof",
-               "let","new","null","return","super","switch","this","throw","true",
-               "try","typeof","undefined","var","void","while","with","yield"},
-    "sh":     {"if","then","else","elif","fi","for","do","done","while","until",
-               "case","esac","function","return","echo","export","source","alias",
-               "local","readonly","declare","unset","shift","exit"},
-    "zig":    {"addrspace","align","allowzero","and","anyframe","anytype","asm",
-               "async","await","break","callconv","catch","comptime","const",
-               "continue","defer","else","enum","errdefer","error","export",
-               "extern","fn","for","if","inline","linksection","noalias",
-               "nosuspend","noinline","opaque","or","orelse","packed","pub",
-               "resume","return","struct","suspend","switch","test","threadlocal",
-               "try","union","unreachable","usingnamespace","var","volatile","while",
-               "true","false","null","undefined"},
-    "rust":   {"as","async","await","break","const","continue","crate","dyn","else",
-               "enum","extern","false","fn","for","if","impl","in","let","loop",
-               "match","mod","move","mut","pub","ref","return","self","Self",
-               "static","struct","super","trait","true","type","union","unsafe",
-               "use","where","while","abstract","become","box","do","final",
-               "macro","override","priv","try","typeof","unsized","virtual","yield",
-               "i8","i16","i32","i64","i128","isize","u8","u16","u32","u64","u128",
-               "usize","f32","f64","bool","char","str","String","Option","Result",
-               "Some","None","Ok","Err","Vec","Box","Arc","Rc","HashMap"},
-    "php":    {"abstract","and","array","as","break","callable","case","catch",
-               "class","clone","const","continue","declare","default","do","echo",
-               "else","elseif","empty","enddeclare","endfor","endforeach","endif",
-               "endswitch","endwhile","enum","extends","final","finally","fn","for",
-               "foreach","function","global","goto","if","implements","include",
-               "include_once","instanceof","insteadof","interface","isset","list",
-               "match","namespace","new","or","print","private","protected","public",
-               "readonly","require","require_once","return","static","switch","throw",
-               "trait","try","unset","use","var","while","xor","yield",
-               "true","false","null","TRUE","FALSE","NULL",
-               "int","float","string","bool","void","array","object","mixed"},
+    "python": {
+        "False",
+        "None",
+        "True",
+        "and",
+        "as",
+        "assert",
+        "async",
+        "await",
+        "break",
+        "class",
+        "continue",
+        "def",
+        "del",
+        "elif",
+        "else",
+        "except",
+        "finally",
+        "for",
+        "from",
+        "global",
+        "if",
+        "import",
+        "in",
+        "is",
+        "lambda",
+        "nonlocal",
+        "not",
+        "or",
+        "pass",
+        "raise",
+        "return",
+        "try",
+        "while",
+        "with",
+        "yield",
+    },
+    "c": {
+        "auto",
+        "break",
+        "case",
+        "char",
+        "const",
+        "continue",
+        "default",
+        "do",
+        "double",
+        "else",
+        "enum",
+        "extern",
+        "float",
+        "for",
+        "goto",
+        "if",
+        "inline",
+        "int",
+        "long",
+        "register",
+        "return",
+        "short",
+        "signed",
+        "sizeof",
+        "static",
+        "struct",
+        "switch",
+        "typedef",
+        "union",
+        "unsigned",
+        "void",
+        "while",
+        "NULL",
+        "true",
+        "false",
+    },
+    "js": {
+        "async",
+        "await",
+        "break",
+        "case",
+        "catch",
+        "class",
+        "const",
+        "continue",
+        "debugger",
+        "default",
+        "delete",
+        "do",
+        "else",
+        "export",
+        "extends",
+        "false",
+        "finally",
+        "for",
+        "function",
+        "if",
+        "import",
+        "in",
+        "instanceof",
+        "let",
+        "new",
+        "null",
+        "return",
+        "super",
+        "switch",
+        "this",
+        "throw",
+        "true",
+        "try",
+        "typeof",
+        "undefined",
+        "var",
+        "void",
+        "while",
+        "with",
+        "yield",
+    },
+    "sh": {
+        "if",
+        "then",
+        "else",
+        "elif",
+        "fi",
+        "for",
+        "do",
+        "done",
+        "while",
+        "until",
+        "case",
+        "esac",
+        "function",
+        "return",
+        "echo",
+        "export",
+        "source",
+        "alias",
+        "local",
+        "readonly",
+        "declare",
+        "unset",
+        "shift",
+        "exit",
+    },
+    "zig": {
+        "addrspace",
+        "align",
+        "allowzero",
+        "and",
+        "anyframe",
+        "anytype",
+        "asm",
+        "async",
+        "await",
+        "break",
+        "callconv",
+        "catch",
+        "comptime",
+        "const",
+        "continue",
+        "defer",
+        "else",
+        "enum",
+        "errdefer",
+        "error",
+        "export",
+        "extern",
+        "fn",
+        "for",
+        "if",
+        "inline",
+        "linksection",
+        "noalias",
+        "nosuspend",
+        "noinline",
+        "opaque",
+        "or",
+        "orelse",
+        "packed",
+        "pub",
+        "resume",
+        "return",
+        "struct",
+        "suspend",
+        "switch",
+        "test",
+        "threadlocal",
+        "try",
+        "union",
+        "unreachable",
+        "usingnamespace",
+        "var",
+        "volatile",
+        "while",
+        "true",
+        "false",
+        "null",
+        "undefined",
+    },
+    "rust": {
+        "as",
+        "async",
+        "await",
+        "break",
+        "const",
+        "continue",
+        "crate",
+        "dyn",
+        "else",
+        "enum",
+        "extern",
+        "false",
+        "fn",
+        "for",
+        "if",
+        "impl",
+        "in",
+        "let",
+        "loop",
+        "match",
+        "mod",
+        "move",
+        "mut",
+        "pub",
+        "ref",
+        "return",
+        "self",
+        "Self",
+        "static",
+        "struct",
+        "super",
+        "trait",
+        "true",
+        "type",
+        "union",
+        "unsafe",
+        "use",
+        "where",
+        "while",
+        "abstract",
+        "become",
+        "box",
+        "do",
+        "final",
+        "macro",
+        "override",
+        "priv",
+        "try",
+        "typeof",
+        "unsized",
+        "virtual",
+        "yield",
+        "i8",
+        "i16",
+        "i32",
+        "i64",
+        "i128",
+        "isize",
+        "u8",
+        "u16",
+        "u32",
+        "u64",
+        "u128",
+        "usize",
+        "f32",
+        "f64",
+        "bool",
+        "char",
+        "str",
+        "String",
+        "Option",
+        "Result",
+        "Some",
+        "None",
+        "Ok",
+        "Err",
+        "Vec",
+        "Box",
+        "Arc",
+        "Rc",
+        "HashMap",
+    },
+    "php": {
+        "abstract",
+        "and",
+        "array",
+        "as",
+        "break",
+        "callable",
+        "case",
+        "catch",
+        "class",
+        "clone",
+        "const",
+        "continue",
+        "declare",
+        "default",
+        "do",
+        "echo",
+        "else",
+        "elseif",
+        "empty",
+        "enddeclare",
+        "endfor",
+        "endforeach",
+        "endif",
+        "endswitch",
+        "endwhile",
+        "enum",
+        "extends",
+        "final",
+        "finally",
+        "fn",
+        "for",
+        "foreach",
+        "function",
+        "global",
+        "goto",
+        "if",
+        "implements",
+        "include",
+        "include_once",
+        "instanceof",
+        "insteadof",
+        "interface",
+        "isset",
+        "list",
+        "match",
+        "namespace",
+        "new",
+        "or",
+        "print",
+        "private",
+        "protected",
+        "public",
+        "readonly",
+        "require",
+        "require_once",
+        "return",
+        "static",
+        "switch",
+        "throw",
+        "trait",
+        "try",
+        "unset",
+        "use",
+        "var",
+        "while",
+        "xor",
+        "yield",
+        "true",
+        "false",
+        "null",
+        "TRUE",
+        "FALSE",
+        "NULL",
+        "int",
+        "float",
+        "string",
+        "bool",
+        "void",
+        "array",
+        "object",
+        "mixed",
+    },
 }
 _SH_KW["py"] = _SH_KW["python"]
 _SH_KW["cpp"] = _SH_KW["c"]
@@ -926,12 +1638,12 @@ _SH_KW["ts"] = _SH_KW["js"]
 _SH_KW["bash"] = _SH_KW["sh"]
 _SH_KW["zsh"] = _SH_KW["sh"]
 
-_CH_DEFAULT = "%reset%color(185,185,185)"
-_CH_KW      = "%reset%color(140,120,210)"
-_CH_STR     = "%reset%color(180,160,80)"
-_CH_NUM     = "%reset%color(210,130,80)"
-_CH_COMMENT = "%reset%color(105,120,85)"
-_CH_GUTTER  = "%color(55,55,70)"
+_CH_DEFAULT = Theme.SYN_DEFAULT
+_CH_KW = Theme.SYN_KEYWORD
+_CH_STR = Theme.SYN_STRING
+_CH_NUM = Theme.SYN_NUMBER
+_CH_COMMENT = Theme.SYN_COMMENT
+_CH_GUTTER = Theme.SYN_GUTTER
 
 
 def _highlight_line(line: str, lang: str) -> str:
@@ -944,19 +1656,19 @@ def _highlight_line(line: str, lang: str) -> str:
         ch = line[i]
 
         # Line comments: #  //  --
-        if ch == "#" or line[i:i+2] in ("//", "--"):
+        if ch == "#" or line[i : i + 2] in ("//", "--"):
             out.append(_CH_COMMENT + line[i:])
             break
 
         # String literals (single/double quote, triple quotes)
         if ch in ('"', "'"):
-            q = line[i:i+3] if line[i:i+3] in ('"""', "'''") else ch
+            q = line[i : i + 3] if line[i : i + 3] in ('"""', "'''") else ch
             j = i + len(q)
             while j < n:
-                if line[j] == "\\" :
+                if line[j] == "\\":
                     j += 2
                     continue
-                if line[j:j+len(q)] == q:
+                if line[j : j + len(q)] == q:
                     j += len(q)
                     break
                 j += 1
@@ -1004,7 +1716,7 @@ def _split_code_blocks(content: str):
         if fi > i:
             yield (False, "", content[i:fi])
         nl = content.find("\n", fi + 3)
-        lang = content[fi + 3:nl].strip() if nl != -1 else ""
+        lang = content[fi + 3 : nl].strip() if nl != -1 else ""
         start = (nl + 1) if nl != -1 else (fi + 3)
         ci = content.find(fence, start)
         if ci == -1:
@@ -1024,7 +1736,9 @@ def _message_lines(content: str, width: int) -> List[str]:
         if is_code:
             for raw in text.rstrip("\n").split("\n"):
                 while len(raw) > code_w:
-                    lines.append(_CH_GUTTER + "▌ " + _highlight_line(raw[:code_w], lang))
+                    lines.append(
+                        _CH_GUTTER + "▌ " + _highlight_line(raw[:code_w], lang)
+                    )
                     raw = raw[code_w:]
                 lines.append(_CH_GUTTER + "▌ " + _highlight_line(raw, lang))
         else:
@@ -1050,9 +1764,13 @@ def render_frame(canvas: Canvas, state: AppState, tick: int) -> None:
         current = state.current_output
         think_text = state.think_output
         think_dur = state.think_duration
+        think_start = state.think_start_time
+        last_turn_tools = list(state.last_turn_tools)
         busy = state.model_busy
         scroll = state.scroll_offset
         show_thinking = state.show_thinking
+        think_label = state.think_label
+        think_scroll = state.think_scroll
 
     username = getpass.getuser()
 
@@ -1071,21 +1789,52 @@ def render_frame(canvas: Canvas, state: AppState, tick: int) -> None:
         # Header line: username (right-aligned) or model name (left)
         if is_user:
             hdr_x = max(W - 3 - len(username), USER_ZONE_START)
-            all_lines.append((hdr_x, "%color(70,70,70)" + username))
+            all_lines.append((hdr_x, Theme.USER_HEADER + username))
         else:
-            all_lines.append((1, "%color(70,70,70)" + _MODEL))
+            all_lines.append((1, Theme.ASST_HEADER + _MODEL))
 
-        # "thought for X s." before the last assistant message
+        # "thought for X s." + tool log after the last assistant message
         if idx == last_asst_idx and think_dur > 0 and not busy:
             secs = f"{think_dur:.1f}"
-            all_lines.append((1, f"%color(80,80,80)│ thought for {secs}s."))
+            all_lines.append((1, f"{Theme.ASST_THOUGHT}│ thought for {secs}s."))
+            for label, done in last_turn_tools:
+                sym = (
+                    f"{Theme.THINK_DONE}✔%reset"
+                    if done
+                    else f"{Theme.THINK_PENDING}◎%reset"
+                )
+                # Colour diff stat tokens
+                parts = label.rsplit("  ", 1)
+                if len(parts) == 2:
+                    base, stat = parts
+                    coloured = ""
+                    for tok in stat.split():
+                        if tok.startswith("+"):
+                            coloured += f" {Theme.DIFF_ADD}{tok}%reset"
+                        elif tok.startswith("-"):
+                            coloured += f" {Theme.DIFF_DEL}{tok}%reset"
+                        else:
+                            coloured += f" {Theme.DIFF_NEUTRAL}{tok}%reset"
+                    all_lines.append(
+                        (
+                            1,
+                            f"{Theme.ASST_THOUGHT}│%reset  {sym} {Theme.THINK_DONE_T}{base}{coloured}",
+                        )
+                    )
+                else:
+                    all_lines.append(
+                        (
+                            1,
+                            f"{Theme.ASST_THOUGHT}│%reset  {sym} {Theme.THINK_DONE_T}{label}",
+                        )
+                    )
 
         if is_user:
             content_lines = _wrap_lines(msg["content"], USER_W)
             for line in content_lines:
                 line = line.strip()
                 line_x = max(W - 3 - len(line), USER_ZONE_START)
-                all_lines.append((line_x, "%color(120,180,255)" + line))
+                all_lines.append((line_x, Theme.USER_TEXT + line))
         else:
             for line in _message_lines(msg["content"], CONTENT_W):
                 all_lines.append((1, line))
@@ -1094,13 +1843,15 @@ def render_frame(canvas: Canvas, state: AppState, tick: int) -> None:
 
     # In-progress assistant reply (streaming)
     if current:
-        all_lines.append((1, "%color(70,70,70)" + _MODEL))
+        all_lines.append((1, Theme.ASST_HEADER + _MODEL))
         for line in _message_lines(current, CONTENT_W):
             all_lines.append((1, line))
 
     # ── Pre-compute think block size so chat layout can avoid it ─────────
     think_rows_reserved = 0
-    think_lines_expanded: List[Tuple[str, str]] = []  # (kind, text): kind ∈ "text","pending","done"
+    think_lines_expanded: List[Tuple[str, str]] = (
+        []
+    )  # (kind, text): kind ∈ "text","pending","done"
 
     _has_think_block = busy and bool(think_text)
 
@@ -1109,11 +1860,17 @@ def render_frame(canvas: Canvas, state: AppState, tick: int) -> None:
         raw: List[Tuple[str, str]] = []
         for line in clean.split("\n"):
             if line.startswith("\x00TOOL_PENDING\x00"):
-                raw.append(("pending", line[len("\x00TOOL_PENDING\x00"):]))
+                raw.append(("pending", line[len("\x00TOOL_PENDING\x00") :]))
             elif line.startswith("\x00TOOL_DONE\x00"):
-                raw.append(("done", line[len("\x00TOOL_DONE\x00"):]))
+                raw.append(("done", line[len("\x00TOOL_DONE\x00") :]))
+                raw.append(("text", ""))  # blank line after tool action
+            elif line.startswith("\x00TOOL_ERROR\x00"):
+                raw.append(("error", line[len("\x00TOOL_ERROR\x00") :]))
+                raw.append(("text", ""))  # blank line after tool action
             else:
-                for wrapped in (_wrap_lines(line.strip(), W - 6) if line.strip() else [""]):
+                for wrapped in (
+                    _wrap_lines(line.strip(), W - 6) if line.strip() else [""]
+                ):
                     raw.append(("text", wrapped))
 
         # Drop leading blank text lines
@@ -1149,46 +1906,89 @@ def render_frame(canvas: Canvas, state: AppState, tick: int) -> None:
     # ── Status bar ─────────────────────────────────────────────────────────
     if busy:
         spin = _SPINNER[(tick // 4) % len(_SPINNER)]
-        status = f"%color(210,120,40){spin}%reset " + _shimmer_line("thinking…", tick)
-        canvas.text(1, STATUS_ROW, status)
+        label = think_label[0].upper() + think_label[1:] if think_label else "Thinking…"
+        elapsed = f"({time.time() - think_start:.0f}s)" if think_start else ""
+        # Left part: spinner + shimmered label
+        left = f"{Theme.SPIN}{spin}%reset " + _shimmer_line(label, tick)
+        # Right part: elapsed right-aligned with 1-char gap from border
+        if elapsed:
+            elapsed_plain = f" {elapsed} "
+            elapsed_x = W - len(elapsed_plain) - 2
+            canvas.text(elapsed_x, STATUS_ROW, f"%color(90,90,90){elapsed_plain}")
+        canvas.text(1, STATUS_ROW, left)
     elif scroll > 0:
         indicator = "↑↓ scroll   ␣ type"
         ind_x = max(0, (W - len(indicator)) // 2)
-        canvas.text(ind_x, STATUS_ROW, "%color(70,70,90)" + indicator)
+        canvas.text(ind_x, STATUS_ROW, Theme.HINT_SCROLL + indicator)
     else:
         hint = "↑↓ scroll   ␣ type"
         hint_x = max(0, (W - len(hint)) // 2)
-        canvas.text(hint_x, STATUS_ROW, "%color(65,65,65)" + hint)
+        canvas.text(hint_x, STATUS_ROW, Theme.HINT + hint)
 
     # ── Think block rendering ──────────────────────────────────────────────
     if _has_think_block and think_lines_expanded:
 
         def _render_think_line(kind: str, text: str) -> str:
             if kind == "pending":
-                return "%color(160,140,60)◎%reset %color(150,140,100)" + text
+                return f"{Theme.THINK_PENDING}◎%reset {Theme.THINK_PENDING_T}" + text
+            if kind == "error":
+                return (
+                    f"{Theme.THINK_ERROR}✘%reset {Theme.THINK_ERROR}" + text + "%reset"
+                )
             if kind == "done":
-                return "%color(70,160,100)✔%reset %color(100,120,100)" + text
-            return "%color(100,100,100)" + text
+                import re as _re
+
+                m = _re.search(r"(  [+\-\d L]+)$", text)
+                if m:
+                    label = text[: m.start()]
+                    stat = m.group(1)
+                    coloured_stat = ""
+                    for tok in stat.split():
+                        if tok.startswith("+"):
+                            coloured_stat += f" {Theme.DIFF_ADD}{tok}%reset"
+                        elif tok.startswith("-"):
+                            coloured_stat += f" {Theme.DIFF_DEL}{tok}%reset"
+                        else:
+                            coloured_stat += f" {Theme.DIFF_NEUTRAL}{tok}%reset"
+                    return (
+                        f"{Theme.THINK_DONE}✔%reset {Theme.THINK_DONE_T}"
+                        + label
+                        + coloured_stat
+                    )
+                return f"{Theme.THINK_DONE}✔%reset {Theme.THINK_DONE_T}" + text
+            return Theme.THINK_TEXT + text
 
         if show_thinking:
             display_rows = think_rows_reserved - 1
-            content = think_lines_expanded[-display_rows:] if display_rows > 0 else []
+            # Apply think_scroll offset
+            total_think = len(think_lines_expanded)
+            max_think_scroll = max(0, total_think - display_rows)
+            t_scroll = min(think_scroll, max_think_scroll)
+            end_idx = total_think - t_scroll
+            start_idx = max(0, end_idx - display_rows)
+            content = think_lines_expanded[start_idx:end_idx]
             while content and content[0] == ("text", ""):
                 content = content[1:]
             block_start = STATUS_ROW - think_rows_reserved
 
-            canvas.text(1, block_start, "%color(55,55,75)  o · collapse thinking")
+            canvas.text(1, block_start, Theme.THINK_GUTTER + "╭─ " + Theme.THINK_HEADER + "o · collapse thinking")
             for i, (kind, text) in enumerate(content):
-                canvas.text(1, block_start + 1 + i,
-                            "%color(80,80,80)│%reset " + _render_think_line(kind, text))
+                canvas.text(
+                    1,
+                    block_start + 1 + i,
+                    Theme.THINK_GUTTER + "│%reset " + _render_think_line(kind, text),
+                )
         else:
             pool = think_lines_expanded[-think_rows_reserved:]
             base_row = STATUS_ROW - 1
             n = len(pool)
             for i, (kind, text) in enumerate(pool):
                 row = base_row - (n - 1 - i)
-                canvas.text(1, row,
-                            "%color(80,80,80)│%reset " + _render_think_line(kind, text))
+                canvas.text(
+                    1,
+                    row,
+                    Theme.THINK_GUTTER + "│%reset " + _render_think_line(kind, text),
+                )
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -1241,20 +2041,96 @@ def _generate_tree(
 def generate_system_prompt(cwd: str) -> str:
     path = Path(cwd).resolve()
     patterns = _load_ignore_patterns(path)
+    tree = _generate_tree(path, path, patterns)
 
-    prompt = "# Project Information\n"
-    prompt += f"> Working directory: `{path}`\n\n"
-    prompt += "## Directory File Structure:\n```\n"
-    prompt += _generate_tree(path, path, patterns)
-    prompt += "```\n\n"
-    prompt += "# Guidelines\n"
-    prompt += "- Use the provided file tools to read files before editing them.\n"
-    prompt += "- Only operate on files within the working directory shown above.\n"
-    prompt += "- Look up language specs for the correct version when writing code.\n"
-    prompt += "- Follow the style of the user's existing code.\n"
-    prompt += "- Keep replies concise. Only point out non-obvious issues.\n"
-    prompt += "- Do not overthink simple tasks.\n"
-    return prompt
+    return f"""You are a senior software engineer. You are working inside a real developer project on the user's computer. You have tools to read, write, create, and delete files, search the web, and consult a critic. USE THESE TOOLS. Do not guess what files contain — read them first.
+
+════════════════════════════════════════
+PROJECT
+════════════════════════════════════════
+
+Working directory: {path}
+
+File tree:
+```
+{tree.rstrip()}
+```
+
+════════════════════════════════════════
+YOUR ROLE
+════════════════════════════════════════
+
+You are a local coding agent. You work like Claude Code or Codex:
+- ALL real work happens inside your thinking.
+- Your visible reply is ONLY a short summary of what you did.
+- The user watches your thinking live. They do not need you to explain your work in the reply — they already saw it happen.
+
+════════════════════════════════════════
+YOUR TOOLS
+════════════════════════════════════════
+
+Call tools freely inside your thinking. No permission needed.
+
+read_file(path)       — Read a file. Paths are relative to the working directory.
+write_file(path, content) — Overwrite a file. MUST provide the full file content.
+create_file(path, content) — Create a new file.
+delete_file(path)     — Delete a file (user confirms).
+web_search(query)     — Search the web for docs, APIs, error messages, facts.
+consult_critic(plan)  — Get adversarial review of your plan or code before committing.
+
+════════════════════════════════════════
+HOW TO WORK
+════════════════════════════════════════
+
+Inside your thinking, do the following in order:
+
+1. Understand the task. One sentence.
+2. Read every relevant file with read_file before touching anything.
+3. If you need external information, call web_search.
+4. Form a plan. Then immediately execute it — do not describe it, do it.
+5. For any non-trivial implementation, call consult_critic before writing the final version.
+6. Call write_file or create_file with the complete, correct content.
+7. Verify your work. If something is wrong, fix it now — do not leave it for the user.
+
+HARD RULES:
+- NEVER read the same file twice.
+- NEVER write partial file content. Every write_file must contain the entire file.
+- NEVER invent what a file contains. Read it first.
+- If you catch yourself writing "I should..." or "I will..." — stop and do it instead.
+- Do not plan. Do not draft. Execute.
+
+════════════════════════════════════════
+YOUR REPLY (after thinking is done)
+════════════════════════════════════════
+
+After your thinking is complete and all files have been written, give the user a SHORT plain-text reply.
+
+YOUR REPLY MUST FOLLOW THESE RULES — NO EXCEPTIONS:
+- NO code. Not a single line. Not a snippet. Not a block. Nothing inside backticks.
+- NO markdown formatting of any kind.
+- NO explanations of how you implemented something.
+- NO walkthroughs, NO "here is what I did", NO "I have implemented...".
+- MAXIMUM 4 lines of text total.
+
+The ONLY things allowed in your reply:
+1. One sentence saying what was done.
+2. A list of files changed, one per line: "filename — what changed"
+3. One line if the user needs to do something (e.g. install a dependency).
+
+If the user wants to see the code, they will open the file. Do not show it to them.
+
+GOOD reply:
+  Implemented the AST calculator with full operator precedence and error handling.
+  calculator.py — created
+  main.py — updated import
+
+BAD reply (NEVER do this):
+  Here is the implementation:
+  ```python
+  class Parser:
+      ...
+  ```
+"""
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -1264,6 +2140,7 @@ def generate_system_prompt(cwd: str) -> str:
 
 def _summarize_and_notify(title: str, messages: List[dict]) -> None:
     """Generate a one-sentence summary of the conversation, then notify."""
+
     def _run() -> None:
         try:
             resp = ollama.chat(
@@ -1283,7 +2160,9 @@ def _summarize_and_notify(title: str, messages: List[dict]) -> None:
                 options={"num_predict": 60, "temperature": 0},
             )
             summary = resp.message.content or ""
-            summary = re.sub(r"<think>.*?</think>", "", summary, flags=re.DOTALL).strip()
+            summary = re.sub(
+                r"<think>.*?</think>", "", summary, flags=re.DOTALL
+            ).strip()
             summary = summary[:80]
         except Exception:
             summary = "Response received."
@@ -1301,6 +2180,32 @@ def main(argv: Tuple[str, ...]) -> None:
     if len(argv) < 2:
         print("Usage: python main.py <directory_path>")
         return
+
+    # Ensure the Ollama daemon is running before anything else
+    try:
+        ollama.list()  # cheap ping — succeeds if daemon is already up
+    except Exception:
+        subprocess.Popen(
+            ["ollama", "serve"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        # Give it a moment to bind its socket
+        for _ in range(20):
+            time.sleep(0.5)
+            try:
+                ollama.list()
+                break
+            except Exception:
+                pass
+
+    # Keep the system awake for the lifetime of this process
+    if platform.system() == "Darwin":
+        subprocess.Popen(
+            ["caffeinate", "-i", "-w", str(os.getpid())],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
 
     target_path = argv[1]
     state = AppState()
@@ -1373,21 +2278,41 @@ def main(argv: Tuple[str, ...]) -> None:
                 if key == "o":
                     with state.lock:
                         state.show_thinking = not state.show_thinking
+                        state.think_scroll = 0
                     continue
 
                 if state.model_busy:
-                    continue  # swallow all other keys while model is running
+                    # Only let scroll keys through when the think box is open
+                    if key in ("\x1b[A", "\x1b[B") and state.show_thinking:
+                        with state.lock:
+                            if key == "\x1b[A":
+                                state.think_scroll += _SCROLL_STEP
+                            else:
+                                state.think_scroll = max(
+                                    0, state.think_scroll - _SCROLL_STEP
+                                )
+                    continue  # swallow everything else while model is running
 
-                if key == "\x1b[A":   # ↑
+                if key == "\x1b[A":  # ↑
                     with state.lock:
-                        state.scroll_offset += _SCROLL_STEP
-                elif key == "\x1b[B": # ↓
+                        if state.show_thinking:
+                            state.think_scroll += _SCROLL_STEP
+                        else:
+                            state.scroll_offset += _SCROLL_STEP
+                elif key == "\x1b[B":  # ↓
                     with state.lock:
-                        state.scroll_offset = max(0, state.scroll_offset - _SCROLL_STEP)
-                elif key == " ":      # space → enter prompt mode
+                        if state.show_thinking:
+                            state.think_scroll = max(
+                                0, state.think_scroll - _SCROLL_STEP
+                            )
+                        else:
+                            state.scroll_offset = max(
+                                0, state.scroll_offset - _SCROLL_STEP
+                            )
+                elif key == " ":  # space → enter prompt mode
                     # ── Read user prompt ───────────────────────────────────
                     _leave_cbreak()
-                    raw_input = (canvas.read_line("> ") or "")
+                    raw_input = canvas.read_line("> ") or ""
                     _enter_cbreak()
 
                     with state.lock:
@@ -1414,6 +2339,7 @@ def main(argv: Tuple[str, ...]) -> None:
 
                     system_prompt = generate_system_prompt(str(root))
                     worker.start(messages_snapshot, system_prompt)
+                    _start_think_labeller(state)
 
             time.sleep(0.016)
 
