@@ -1,46 +1,52 @@
 """
-Ollama chat TUI — single-file, well-architected.
+ollama-code  —  local AI coding agent, single-file.
 
 Usage:
     python main.py <directory_path>
 
-Architecture:
-    Symbol / TextBox / Canvas  – low-level terminal drawing primitives (unchanged)
-    AppState                   – thread-safe shared state
-    OllamaWorker               – streams Ollama responses on a background thread
-    Renderer                   – builds each frame from AppState
-    helpers                    – file-tree / prompt / notification utilities
-    main()                     – event loop: render → wait for input → dispatch
+Layout:
+  § 1  Theme                     — colour palette (unchanged)
+  § 2  Symbol / TextBox / Canvas — terminal drawing primitives (unchanged)
+  § 3  AppState / ToolEvent      — clean shared state model
+  § 4  Tool schemas              — JSON tool definitions
+  § 5  Tool implementations      — file I/O, shell, web, critic
+  § 6  Think labeller            — background label-generator thread
+  § 7  AgentWorker               — streaming agentic loop (rewritten)
+  § 8  Renderer                  — render_frame (updated for clean model)
+  § 9  Filesystem / prompt       — tree builder + system prompt
+  § 10 Notification              — post-turn desktop notify
+  § 11 main()                    — event loop
 """
 
 from __future__ import annotations
 
 import fnmatch
 import getpass
+import json
 import os
 import platform
 import re
+import select
+import subprocess
 import sys
 import termios
 import threading
 import time
+import tty
 from dataclasses import dataclass, field
 from enum import Enum, auto
 from pathlib import Path
-from typing import Any, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import ollama
+import requests
 from bs4 import BeautifulSoup
 from duckduckgo_search import DDGS
 from plyer import notification
-import requests
-import select
-import subprocess
-import tty
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# Theme  — all colour definitions in one place
+# § 1  Theme
 # ═══════════════════════════════════════════════════════════════════════════════
 
 
@@ -48,30 +54,30 @@ class Theme:
     """Central colour palette.  Change values here to restyle the entire UI."""
 
     # ── Chat ──────────────────────────────────────────────────────────────────
-    USER_TEXT = "%color(120,180,255)"  # user bubble text
-    USER_HEADER = "%color(70,70,70)"  # username / model name label
-    ASST_THOUGHT = "%color(80,80,80)"  # "thought for Xs." line
-    ASST_HEADER = "%color(70,70,70)"  # model name label
+    USER_TEXT = "%color(120,180,255)"
+    USER_HEADER = "%color(70,70,70)"
+    ASST_THOUGHT = "%color(80,80,80)"
+    ASST_HEADER = "%color(70,70,70)"
 
     # ── Think block ───────────────────────────────────────────────────────────
-    THINK_GUTTER = "%color(80,80,80)"  # │ prefix
-    THINK_TEXT = "%color(100,100,100)"  # plain thinking text
-    THINK_HEADER = "%color(55,55,75)"  # "o · collapse thinking" label
-    THINK_PENDING = "%color(160,140,60)"  # ◎ symbol colour
-    THINK_PENDING_T = "%color(150,140,100)"  # pending label text
-    THINK_DONE = "%color(70,160,100)"  # ✔ symbol colour
-    THINK_DONE_T = "%color(100,120,100)"  # done label text
-    THINK_ERROR = "%color(210,70,70)"  # ✘ symbol + error label
+    THINK_GUTTER = "%color(80,80,80)"
+    THINK_TEXT = "%color(100,100,100)"
+    THINK_HEADER = "%color(55,55,75)"
+    THINK_PENDING = "%color(160,140,60)"
+    THINK_PENDING_T = "%color(150,140,100)"
+    THINK_DONE = "%color(70,160,100)"
+    THINK_DONE_T = "%color(100,120,100)"
+    THINK_ERROR = "%color(210,70,70)"
 
     # ── Status bar ────────────────────────────────────────────────────────────
-    SPIN = "%color(210,120,40)"  # spinner colour
-    HINT = "%color(65,65,65)"  # idle hint text
-    HINT_SCROLL = "%color(70,70,90)"  # scroll-mode hint text
+    SPIN = "%color(210,120,40)"
+    HINT = "%color(65,65,65)"
+    HINT_SCROLL = "%color(70,70,90)"
 
-    # ── Diff stats (tool done line) ───────────────────────────────────────────
-    DIFF_ADD = "%color(80,180,100)"  # +N added lines
-    DIFF_DEL = "%color(200,80,80)"  # -N removed lines
-    DIFF_NEUTRAL = "%color(90,90,90)"  # line count / neutral stat
+    # ── Diff stats ───────────────────────────────────────────────────────────
+    DIFF_ADD = "%color(80,180,100)"
+    DIFF_DEL = "%color(200,80,80)"
+    DIFF_NEUTRAL = "%color(90,90,90)"
 
     # ── Syntax highlighting ───────────────────────────────────────────────────
     SYN_DEFAULT = "%reset%color(185,185,185)"
@@ -82,12 +88,12 @@ class Theme:
     SYN_GUTTER = "%color(55,55,70)"
 
     # ── Canvas border ─────────────────────────────────────────────────────────
-    BORDER = "\u001b[38;2;55;55;65m"  # raw ANSI — used before markup engine
+    BORDER = "\u001b[38;2;55;55;65m"
     BORDER_RESET = "\u001b[0m"
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# Drawing primitives
+# § 2  Drawing primitives  (Symbol / TextBox / Canvas)  — UNCHANGED
 # ═══════════════════════════════════════════════════════════════════════════════
 
 
@@ -116,22 +122,12 @@ class Symbol:
 
     @staticmethod
     def from_string(text: str) -> List[Symbol]:
-        """Parse a markup string into a list of Symbol objects.
-
-        Supported markup tags (prefixed with %):
-            %reset          – reset colour/style
-            %color(r,g,b)   – set 24-bit foreground colour
-            %bold           – bold text
-            %underline      – underline text
-        """
         symbols: List[Symbol] = []
         escape_sequence = "\u001b[0m"
         i = 0
-
         while i < len(text):
             index = i
             i += 1
-
             if text[index] != "%":
                 symbols.append(Symbol(text[index], escape_sequence))
                 continue
@@ -168,7 +164,6 @@ class Symbol:
                 i = index + 10
             else:
                 symbols.append(Symbol("%", escape_sequence))
-
         return symbols
 
     @staticmethod
@@ -187,8 +182,6 @@ class Alignment(Enum):
 
 
 class TextBox:
-    """Simple text-layout helper with horizontal/vertical alignment."""
-
     def __init__(
         self,
         width: int,
@@ -202,7 +195,6 @@ class TextBox:
         self.horizontal_alignment = horizontal_alignment
         self.vertical_alignment = vertical_alignment
         self._buffer: List[List[Symbol]] = Symbol.buffer(width, height)
-
         if text is not None:
             self.content(text)
         else:
@@ -290,13 +282,9 @@ class Canvas:
         self._frame_buffer: List[List[Symbol]] = Symbol.buffer(0, 0)
         self.resize(w, h)
 
-    # ── Terminal helpers ────────────────────────────────────────────────────
-
     def _get_terminal_size(self) -> Tuple[int, int]:
         size = os.get_terminal_size()
         return size.columns, size.lines
-
-    # ── Cursor helpers ──────────────────────────────────────────────────────
 
     def hide_cursor(self) -> None:
         self._is_cursor_hidden = True
@@ -327,8 +315,6 @@ class Canvas:
         except Exception:
             pass
 
-    # ── Reset / resize ──────────────────────────────────────────────────────
-
     def reset_console(self) -> None:
         self._cache_buffer = Symbol.buffer(self.width, self.height)
         self._frame_buffer = Symbol.buffer(self.width, self.height)
@@ -344,11 +330,9 @@ class Canvas:
             tw, th = self._get_terminal_size()
             width = width if width is not None else tw
             height = height if height is not None else th
-
         self.reset_console()
         if hasattr(sys.stdout, "reconfigure"):
             sys.stdout.reconfigure(encoding="utf-8")  # type: ignore[union-attr]
-
         tw, th = self._get_terminal_size()
         self._terminal_width = tw
         self._terminal_height = th
@@ -358,7 +342,6 @@ class Canvas:
         self._position_x = max(1, tw // 2 - self.width // 2)
         self._cache_buffer = Symbol.buffer(self.width, self.height)
         self._frame_buffer = Symbol.buffer(self.width, self.height)
-
         _B = Theme.BORDER
         _R = Theme.BORDER_RESET
         buf: List[str] = []
@@ -383,11 +366,8 @@ class Canvas:
                     buf.append(_B + "│" + _R)
                 else:
                     buf.append(" ")
-
         sys.stdout.write("".join(buf))
         sys.stdout.flush()
-
-    # ── Drawing primitives ──────────────────────────────────────────────────
 
     def text(
         self, start_x: int, start_y: int, text: str, overflow: bool = True
@@ -422,8 +402,6 @@ class Canvas:
                 if s.content != "\0" and s.content not in (" ", "\t"):
                     self._frame_buffer[y][x] = s
 
-    # ── Flush ───────────────────────────────────────────────────────────────
-
     def draw(self) -> None:
         tw, th = self._get_terminal_size()
         if tw != self._terminal_width or th != self._terminal_height:
@@ -431,7 +409,6 @@ class Canvas:
             self._terminal_height = th
             self.resize(self.width, self.height)
             self._cache_buffer = Symbol.buffer(self.width, self.height)
-
         if self.height > self._terminal_height or self.width > self._terminal_width:
             midtext = "Please resize the console!"
             subtext = "(Minimum 96x36)"
@@ -444,7 +421,6 @@ class Canvas:
             self.move_cursor_to_bottom(0)
             sys.stdout.flush()
             return
-
         out: List[str] = []
         for y in range(min(self.height, self._terminal_height)):
             for x in range(min(self.width, self._terminal_width)):
@@ -458,7 +434,6 @@ class Canvas:
                 row = self._position_y + y
                 out.append(f"\u001b[{row + 1};{col + 1}H{frame_sym}")
             out.append("\u001b[0m")
-
         sys.stdout.write("".join(out))
         self.move_cursor_to_bottom()
         sys.stdout.flush()
@@ -491,7 +466,6 @@ class Canvas:
             result = type(default)(raw) if default is not None else raw
         except Exception:
             result = default
-        # Erase everything from the input row downward (handles any wrap length)
         self.set_cursor_position(self._position_x, input_row)
         sys.stdout.write("\u001b[J")
         sys.stdout.flush()
@@ -500,70 +474,106 @@ class Canvas:
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# App State  (shared between main thread and OllamaWorker thread)
+# § 3  Shared state
 # ═══════════════════════════════════════════════════════════════════════════════
+
+
+class ToolStatus(Enum):
+    PENDING = auto()
+    DONE = auto()
+    ERROR = auto()
+
+
+@dataclass
+class ToolEvent:
+    """One tool invocation, tracked separately from raw think text."""
+
+    name: str  # function name  e.g. "write_file"
+    label: str  # display label  e.g. "writing main.py"
+    status: ToolStatus = ToolStatus.PENDING
+    stat: str = ""  # diff stat      e.g. "+24 -3" or "45L"
+
+
+@dataclass
+class ConfirmRequest:
+    """Posted by the worker thread; resolved by the main event loop."""
+
+    prompt: str
+    result: Optional[bool] = None
+    event: threading.Event = field(default_factory=threading.Event)
 
 
 @dataclass
 class AppState:
+    # ── Conversation history ─────────────────────────────────────────────────
     messages: List[dict] = field(default_factory=list)
-    """Full conversation history (user + assistant turns)."""
 
-    current_output: str = ""
-    """Accumulates tokens from the currently streaming response."""
+    # ── Live streaming buffers ───────────────────────────────────────────────
+    current_output: str = ""  # tokens that form the visible reply
+    think_output: str = ""  # raw think text (no sentinels, plain text)
 
-    think_output: str = ""
-    """Accumulates thinking text (inside <think>…</think>) while streaming."""
+    # ── Tool event log for current turn ─────────────────────────────────────
+    tool_events: List[ToolEvent] = field(default_factory=list)
 
-    think_start_time: float = 0.0
-    """Wall-clock time when the current <think> block started."""
-
+    # ── Think timing ────────────────────────────────────────────────────────
+    think_start: float = 0.0
     think_duration: float = 0.0
-    """Seconds spent in the last completed think block (0 = no think yet)."""
 
-    model_busy: bool = False
-    """True while the Ollama thread is running — blocks user input."""
-
-    stop_requested: bool = False
-    """Set to True by ESC to abort the current generation."""
-
-    last_turn_tools: List[Tuple[str, bool]] = field(default_factory=list)
-    """Tool calls from the last completed turn: (label, done). Shown below 'thought for' line."""
-
-    think_scroll: int = 0
-    """Lines scrolled up inside the expanded think box."""
-
+    # ── Dynamic think label ──────────────────────────────────────────────────
     think_label: str = "thinking…"
-    """Dynamic status label updated by the background label-generator thread."""
+
+    # ── Scroll state ────────────────────────────────────────────────────────
+    scroll_offset: int = 0  # chat scroll (lines from bottom)
+    think_scroll: int = 0  # think-box scroll (lines from bottom)
+    think_mode: int = 0  # 0=hidden 1=collapsed(3 lines) 2=expanded
+
+    # ── Control ──────────────────────────────────────────────────────────────
+    model_busy: bool = False
+    stop_requested: bool = False
+    running: bool = True
+    reply_started: bool = False  # True only while final reply is streaming
+
+    # ── Confirm request (worker → main thread) ──────────────────────────────
+    confirm_request: Optional["ConfirmRequest"] = None
+
+    # ── Completed-turn summary (shown in chat after busy = False) ────────────
+    last_turn_tools: List[ToolEvent] = field(default_factory=list)
 
     lock: threading.Lock = field(default_factory=threading.Lock)
-    running: bool = True
-    scroll_offset: int = 0
-    """Lines scrolled up from the bottom (0 = newest content visible)."""
-    show_thinking: bool = False
-    """When True, expand the think box to show full thought process."""
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# Ollama Worker
+# § 4  Tool schemas  (JSON passed to Ollama)
 # ═══════════════════════════════════════════════════════════════════════════════
 
-_SPINNER = ["·", "✻", "✽", "✶", "✳", "✢", "✳", "✶", "✽", "✻"]
 _MODEL = "qwen3:8b"
+_SMALL_MODEL = "llama3.2:latest"
 
-
-_TOOLS = [
+_TOOLS: List[dict] = [
     {
         "type": "function",
         "function": {
             "name": "read_file",
-            "description": "Read the full contents of a file in the project directory.",
+            "description": (
+                "Read a file in the project directory. "
+                "Without start_line/end_line returns up to 300 lines; if the file is longer "
+                "a truncation notice is appended — use start_line/end_line to read further sections. "
+                "Use search_file first to locate the relevant region in large files."
+            ),
             "parameters": {
                 "type": "object",
                 "properties": {
                     "path": {
                         "type": "string",
-                        "description": "Relative path from the project root.",
+                        "description": "Relative path from project root.",
+                    },
+                    "start_line": {
+                        "type": "integer",
+                        "description": "1-based line to start reading from (inclusive). Defaults to 1.",
+                    },
+                    "end_line": {
+                        "type": "integer",
+                        "description": "1-based line to stop reading at (inclusive). Defaults to start_line + 299.",
                     },
                 },
                 "required": ["path"],
@@ -574,17 +584,20 @@ _TOOLS = [
         "type": "function",
         "function": {
             "name": "write_file",
-            "description": "Overwrite an existing file with new content.",
+            "description": (
+                "Overwrite an existing file with new content. "
+                "You MUST provide the COMPLETE file — partial writes are not allowed."
+            ),
             "parameters": {
                 "type": "object",
                 "properties": {
                     "path": {
                         "type": "string",
-                        "description": "Relative path from the project root.",
+                        "description": "Relative path from project root.",
                     },
                     "content": {
                         "type": "string",
-                        "description": "Full new content for the file.",
+                        "description": "Complete new content for the file.",
                     },
                 },
                 "required": ["path", "content"],
@@ -601,7 +614,7 @@ _TOOLS = [
                 "properties": {
                     "path": {
                         "type": "string",
-                        "description": "Relative path from the project root.",
+                        "description": "Relative path from project root.",
                     },
                     "content": {
                         "type": "string",
@@ -616,13 +629,13 @@ _TOOLS = [
         "type": "function",
         "function": {
             "name": "delete_file",
-            "description": "Delete a file. The user will be asked to confirm before deletion.",
+            "description": "Delete a file. User confirmation is required before deletion.",
             "parameters": {
                 "type": "object",
                 "properties": {
                     "path": {
                         "type": "string",
-                        "description": "Relative path from the project root.",
+                        "description": "Relative path from project root.",
                     },
                 },
                 "required": ["path"],
@@ -632,11 +645,59 @@ _TOOLS = [
     {
         "type": "function",
         "function": {
+            "name": "search_file",
+            "description": (
+                "Search for a pattern inside a file and return matching lines with context. "
+                "Use this before read_file on large files to locate the region you need."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": {
+                        "type": "string",
+                        "description": "Relative path from project root.",
+                    },
+                    "pattern": {
+                        "type": "string",
+                        "description": "Case-insensitive substring or regex pattern to search for.",
+                    },
+                    "context_lines": {
+                        "type": "integer",
+                        "description": "Number of lines of context to show around each match (default 3).",
+                    },
+                },
+                "required": ["path", "pattern"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "run_command",
+            "description": (
+                "Run a shell command in the project directory and return its output. "
+                "Use for: running tests, installing dependencies, building, linting, git commands, etc. "
+                "User must confirm before the command executes. Timeout: 60 seconds."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "command": {
+                        "type": "string",
+                        "description": "Shell command to execute.",
+                    },
+                },
+                "required": ["command"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "web_search",
             "description": (
-                "Search the web for up-to-date information. "
-                "Fetches the top 2 results, extracts relevant content, and returns a summary. "
-                "Use this for anything requiring current knowledge, documentation, or external facts."
+                "Search the web for up-to-date information: docs, APIs, error messages, stack traces, news. "
+                "Returns a summary of the top results."
             ),
             "parameters": {
                 "type": "object",
@@ -652,18 +713,16 @@ _TOOLS = [
         "function": {
             "name": "consult_critic",
             "description": (
-                "Submit your current plan or implementation to a cold, adversarial critic for review. "
-                "The critic will find flaws, edge cases, wrong assumptions, and logical errors — "
-                "things you might have missed. Use this when you are about to commit to an approach "
-                "on a complex task, or when a previous attempt failed. "
-                "Pass your full plan or the relevant code/reasoning as the argument."
+                "Submit your plan or draft implementation to an adversarial critic. "
+                "The critic will find flaws, wrong assumptions, missing edge cases, and logic errors. "
+                "Call this before committing to a non-trivial implementation, or after a previous attempt failed."
             ),
             "parameters": {
                 "type": "object",
                 "properties": {
                     "plan": {
                         "type": "string",
-                        "description": "Your current plan, reasoning, or implementation draft to be critiqued.",
+                        "description": "Your current plan, reasoning, or code draft to be critiqued.",
                     },
                 },
                 "required": ["plan"],
@@ -673,89 +732,292 @@ _TOOLS = [
 ]
 
 
-def _web_search(query: str) -> str:
-    """Search the web and return summarised content for *query*."""
-    _SEARCH_MODEL = "llama3.2:latest"
+# ═══════════════════════════════════════════════════════════════════════════════
+# § 5  Tool implementations
+# ═══════════════════════════════════════════════════════════════════════════════
 
-    # DuckDuckGo search — use as context manager, retry once on failure
+
+def _safe_path(rel: str, root: Path) -> Optional[Path]:
+    """Resolve *rel* inside *root*; return None if the path escapes."""
+    try:
+        resolved = (root / rel).resolve()
+        resolved.relative_to(root)
+        return resolved
+    except Exception:
+        return None
+
+
+def _diff_stat(path: Optional[Path], before_lines: Optional[int], fn: str) -> str:
+    """Compute a +N/-N stat string by comparing before/after line counts."""
+    if path is None or before_lines is None:
+        return ""
+    try:
+        after_lines = (
+            len(path.read_text(encoding="utf-8").splitlines()) if path.exists() else 0
+        )
+    except Exception:
+        return ""
+    added = max(0, after_lines - before_lines)
+    removed = max(0, before_lines - after_lines)
+    if fn == "read_file":
+        return f"  {before_lines}L"
+    if fn == "delete_file" and removed > 0:
+        return f"  -{removed}"
+    parts = []
+    if added:
+        parts.append(f"+{added}")
+    if removed:
+        parts.append(f"-{removed}")
+    return ("  " + " ".join(parts)) if parts else ""
+
+
+_READ_LINE_LIMIT = 300  # max lines returned without explicit range
+
+
+def _tool_read_file(
+    path: Path, rel: str, start_line: int = 1, end_line: Optional[int] = None
+) -> str:
+    if not path.exists():
+        return f"[ERROR] File not found: {rel}"
+    try:
+        all_lines = path.read_text(encoding="utf-8").splitlines()
+    except Exception as e:
+        return f"[ERROR] {e}"
+
+    total = len(all_lines)
+    # Clamp to valid 1-based range
+    start = max(1, start_line)
+    if end_line is None:
+        end = start + _READ_LINE_LIMIT - 1
+    else:
+        end = end_line
+    end = min(end, total)
+
+    chunk = all_lines[start - 1 : end]
+    header = f"[FILE READ: {rel}  lines {start}-{end} of {total}  — this is a tool result, not user input]\n"
+    body   = "\n".join(f"{start + i:>6}  {line}" for i, line in enumerate(chunk))
+
+    footer = (
+        f"\n[END OF CHUNK — {total - end} more lines remain. "
+        f"To read the next section call read_file(path=\"{rel}\", start_line={end + 1}). "
+        f"Your task has not changed — continue working on it.]"
+        if end < total else f"\n[END OF FILE: {rel}]"
+    )
+    return header + body + footer
+
+
+def _tool_search_file(
+    path: Path, rel: str, pattern: str, context_lines: int = 3
+) -> str:
+    """Search for *pattern* (regex, case-insensitive) in *path*.
+    Returns matching lines with line numbers and context."""
+    if not path.exists():
+        return f"[ERROR] File not found: {rel}"
+    try:
+        lines = path.read_text(encoding="utf-8").splitlines()
+    except Exception as e:
+        return f"[ERROR] {e}"
+
+    try:
+        rx = re.compile(pattern, re.IGNORECASE)
+    except re.error as e:
+        return f"[ERROR] Invalid pattern: {e}"
+
+    hits: List[int] = [i for i, ln in enumerate(lines) if rx.search(ln)]
+    if not hits:
+        return f"No matches for {pattern!r} in {rel}"
+
+    ctx = max(0, context_lines)
+    shown: set = set()
+    blocks: List[str] = []
+    for h in hits:
+        lo = max(0, h - ctx)
+        hi = min(len(lines) - 1, h + ctx)
+        if lo in shown:
+            continue
+        block_lines = []
+        for i in range(lo, hi + 1):
+            shown.add(i)
+            marker = ">" if i == h else " "
+            block_lines.append(f"{i + 1:>6} {marker} {lines[i]}")
+        blocks.append("\n".join(block_lines))
+
+    total_matches = len(hits)
+    header = f"[{rel} - {total_matches} match{'es' if total_matches != 1 else ''} for {pattern!r}]\n"
+    return header + "\n---\n".join(blocks)
+
+
+def _file_diff(rel: str, before: str, after: str) -> str:
+    """Return a unified diff between *before* and *after* content.
+    Gives the model a precise record of exactly what changed so it does not
+    re-derive the content on the next thinking turn."""
+    import difflib
+
+    before_lines = before.splitlines(keepends=True)
+    after_lines = after.splitlines(keepends=True)
+    diff = list(
+        difflib.unified_diff(
+            before_lines,
+            after_lines,
+            fromfile=f"a/{rel}",
+            tofile=f"b/{rel}",
+            lineterm="",
+        )
+    )
+    after_n = len(after.splitlines())
+    if not diff:
+        return f"OK: {after_n} lines — no changes (content identical)"
+    diff_text = "\n".join(diff)
+    added = sum(1 for l in diff if l.startswith("+") and not l.startswith("+++"))
+    removed = sum(1 for l in diff if l.startswith("-") and not l.startswith("---"))
+    return f"OK: wrote {after_n} lines to {rel} (+{added} -{removed})\n```diff\n{diff_text}\n```"
+
+
+def _tool_write_file(path: Path, rel: str, content: str) -> str:
+    if not path.exists():
+        return f"[ERROR] File does not exist (use create_file): {rel}"
+    try:
+        before = path.read_text(encoding="utf-8")
+        path.write_text(content, encoding="utf-8")
+        return _file_diff(rel, before, content)
+    except Exception as e:
+        return f"[ERROR] {e}"
+
+
+def _tool_create_file(path: Path, rel: str, content: str) -> str:
+    if path.exists():
+        return f"[ERROR] File already exists: {rel}"
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(content, encoding="utf-8")
+        lines = content.splitlines()
+        n = len(lines)
+        if n <= 10:
+            preview = "\n".join(lines)
+        else:
+            head = "\n".join(lines[:4])
+            tail = "\n".join(lines[-3:])
+            preview = f"{head}\n… ({n - 7} lines) …\n{tail}"
+        return f"OK: created {rel} ({n} lines)\n---\n{preview}\n---"
+    except Exception as e:
+        return f"[ERROR] {e}"
+
+
+def _tool_delete_file(path: Path, rel: str) -> str:
+    if not path.exists():
+        return f"[ERROR] File not found: {rel}"
+    try:
+        path.unlink()
+        return f"OK: deleted {rel}"
+    except Exception as e:
+        return f"[ERROR] {e}"
+
+
+def _tool_run_command(command: str, cwd: Path) -> str:
+    """Execute *command* in *cwd* with a 60-second timeout. Return combined output."""
+    try:
+        # Prepend an explicit `cd` so that shell=True reliably runs in the
+        # right directory regardless of the Python process's own cwd.
+        full_cmd = f"cd {cwd.absolute().as_posix()!r} && {command}"
+        result = subprocess.run(
+            full_cmd,
+            shell=True,
+            capture_output=True,
+            text=True,
+            timeout=60,
+        )
+        parts: List[str] = []
+        if result.stdout.strip():
+            parts.append(result.stdout.strip())
+        if result.stderr.strip():
+            parts.append(f"stderr:\n{result.stderr.strip()}")
+        parts.append(f"exit: {result.returncode}")
+        return "\n".join(parts)
+    except subprocess.TimeoutExpired:
+        return "[ERROR] Command timed out after 60 seconds."
+    except Exception as e:
+        return f"[ERROR] {e}"
+
+
+def _tool_web_search(query: str) -> str:
+    """DuckDuckGo search → fetch top pages → summarise with small model."""
+    # 1. Search
     urls: List[str] = []
-    last_exc: Exception = Exception("unknown")
     for attempt in range(3):
         try:
             with DDGS() as ddgs:
                 results = list(ddgs.text(query, max_results=3, region="us-en"))
             urls = [str(r["href"]) for r in results if r.get("href")]
             break
-        except Exception as e:
-            last_exc = e
-            time.sleep(1.5)
+        except Exception:
+            time.sleep(1.5 * (attempt + 1))
 
     if not urls:
-        return f"[ERROR] Search failed — {last_exc}"
+        return "[ERROR] Search failed — no results returned."
 
-    # Fetch each URL, extract text, summarise with the small model
+    # 2. Fetch + summarise each unique domain
     summaries: List[str] = []
     seen_domains: set = set()
 
     for url in urls:
         if not url.startswith("http"):
             continue
-        domain = url.replace("https://", "").replace("http://", "").split("/")[0]
+        domain = re.sub(r"https?://", "", url).split("/")[0]
         if domain in seen_domains:
             continue
         seen_domains.add(domain)
 
         try:
             html = requests.get(
-                url, timeout=5, headers={"User-Agent": "Mozilla/5.0"}
+                url, timeout=6, headers={"User-Agent": "Mozilla/5.0"}
             ).text
             text = BeautifulSoup(html, "html.parser").get_text(
                 separator=" ", strip=True
             )
-            text = text[:6000]
+            text = text[:5000]
 
             resp = ollama.chat(
-                model=_SEARCH_MODEL,
+                model=_SMALL_MODEL,
                 messages=[
                     {
                         "role": "system",
                         "content": (
-                            f"IGNORE THE USER'S REQUEST. Analyze the input and highlight "
-                            f'KEY INFORMATION relevant to: "{query}". '
-                            "ONLY respond with the highlighted information."
+                            f'Extract only the information relevant to: "{query}". '
+                            "Be concise and factual. Respond ONLY with the relevant content, "
+                            "no preamble, no commentary."
                         ),
                     },
                     {"role": "user", "content": text},
                 ],
                 stream=False,
+                options={"num_predict": 300, "temperature": 0},
             )
             summary = (resp.message.content or "").strip()
             if summary:
-                summaries.append(f'Summary of "{url}":\n```\n{summary}\n```')
+                summaries.append(f"[{url}]\n{summary}")
         except Exception:
             continue
 
-    if not summaries:
-        return "[ERROR] Could not retrieve content from any result."
+    return (
+        "\n\n".join(summaries)
+        if summaries
+        else "[ERROR] Could not retrieve content from any result."
+    )
 
-    return "\n\n".join(summaries)
 
-
-def _consult_critic(plan: str) -> str:
-    """Run the plan through an adversarial critic instance and return its verdict."""
-    _CRITIC_SYSTEM = """\
-You are a ruthless, adversarial code and logic critic. Your only job is to find what is WRONG.
-
-Rules:
-- Be cold, direct, and specific. No encouragement. No praise.
-- List every flaw, incorrect assumption, missing edge case, and logical error you find.
-- If the approach is fundamentally broken, say so plainly and explain why.
-- If a specific part is correct, skip it — only report problems.
-- Be concrete: cite exact lines, variable names, or steps that are wrong.
-- If you find nothing wrong, say exactly: "No issues found." Nothing else.
-
-You are not here to be kind. You are here to prevent bugs from shipping."""
-
+def _tool_consult_critic(plan: str) -> str:
+    """Run *plan* through an adversarial critic instance and return its verdict."""
+    _CRITIC_SYSTEM = (
+        "You are a ruthless adversarial code and logic critic. "
+        "Your ONLY job is to find what is WRONG.\n\n"
+        "Rules:\n"
+        "- Be cold, direct, specific. No praise. No encouragement.\n"
+        "- List every flaw: incorrect assumptions, missing edge cases, logic errors, security issues.\n"
+        "- If the approach is fundamentally broken, say so and explain why.\n"
+        "- Skip anything that is correct — only report problems.\n"
+        "- Be concrete: cite exact lines, variable names, or steps that are wrong.\n"
+        '- If you find nothing wrong, say exactly: "No issues found." Nothing else.'
+    )
     try:
         resp = ollama.chat(
             model=_MODEL,
@@ -767,63 +1029,48 @@ You are not here to be kind. You are here to prevent bugs from shipping."""
             options={"temperature": 0},
         )
         verdict = (resp.message.content or "").strip()
-        # Strip any think tags the model emits
         verdict = re.sub(r"<think>.*?</think>", "", verdict, flags=re.DOTALL).strip()
         return verdict or "Critic returned an empty response."
     except Exception as e:
         return f"[ERROR] Critic call failed: {e}"
 
 
-def _safe_path(rel: str, root: Path) -> Optional[Path]:
-    """Resolve *rel* relative to *root* and ensure it stays inside *root*.
-    Returns None if the path escapes the root."""
-    try:
-        resolved = (root / rel).resolve()
-        resolved.relative_to(root)  # raises ValueError if outside
-        return resolved
-    except (ValueError, Exception):
-        return None
+# ═══════════════════════════════════════════════════════════════════════════════
+# § 6  Think labeller  (background daemon thread)
+# ═══════════════════════════════════════════════════════════════════════════════
 
 
 def _start_think_labeller(state: AppState) -> None:
-    """Spawn a daemon thread that periodically summarises the last 10 think
-    paragraphs into a short label and writes it to state.think_label.
-
-    Polls every ~2 s, debounces on content change, calls llama3.2 at
-    temperature 0 to produce a 4-8 word present-tense phrase.
-    Stops automatically when model_busy becomes False."""
-
-    _LABEL_MODEL = "llama3.2:latest"
-    _POLL_INTERVAL = 2.0
-    _MIN_CHARS = 80
+    """
+    Daemon thread: every ~2 s, summarise the last few paragraphs of think_output
+    into a short status phrase and write it to state.think_label.
+    Stops automatically when model_busy becomes False.
+    """
+    _POLL = 2.0
+    _MIN_CHARS = 60
 
     _SYSTEM = (
         "You are a concise status-line generator. "
-        "The user will paste raw thinking text from an AI reasoning trace. "
+        "The user will paste raw reasoning text from an AI. "
         "Reply with a single short phrase (4-8 words, present tense, lowercase) "
-        "describing what the AI is currently working on — e.g. "
-        "'parsing operator precedence rules' or 'checking edge cases for division'. "
+        "describing what the AI is doing — e.g. 'parsing function signatures' or "
+        "'checking edge cases for division'. "
         "Output ONLY that phrase. No punctuation at the end. Nothing else."
     )
 
     def _run() -> None:
         last_snapshot = ""
         while True:
-            time.sleep(_POLL_INTERVAL)
-
+            time.sleep(_POLL)
             with state.lock:
                 if not state.model_busy:
                     state.think_label = "thinking…"
-                    break
+                    return
                 raw = state.think_output
 
-            # Strip tags and tool sentinels, keep plain text
-            clean = re.sub(r"</?think>", "", raw)
-            clean = re.sub(r"\x00TOOL_(?:PENDING|DONE)\x00[^\n]*", "", clean)
-
-            # Last 10 non-empty paragraphs
-            paras = [p.strip() for p in re.split(r"\n{2,}", clean) if p.strip()]
-            excerpt = "\n\n".join(paras[-10:])
+            # Keep last 8 non-empty paragraphs
+            paras = [p.strip() for p in re.split(r"\n{2,}", raw) if p.strip()]
+            excerpt = "\n\n".join(paras[-8:])
 
             if len(excerpt) < _MIN_CHARS or excerpt == last_snapshot:
                 continue
@@ -831,7 +1078,7 @@ def _start_think_labeller(state: AppState) -> None:
 
             try:
                 resp = ollama.chat(
-                    model=_LABEL_MODEL,
+                    model=_SMALL_MODEL,
                     messages=[
                         {"role": "system", "content": _SYSTEM},
                         {"role": "user", "content": excerpt},
@@ -843,7 +1090,7 @@ def _start_think_labeller(state: AppState) -> None:
                 label = re.sub(
                     r"<think>.*?</think>", "", label, flags=re.DOTALL
                 ).strip()
-                label = label.rstrip(".,;")
+                label = label.rstrip(".,;:")
                 if label:
                     with state.lock:
                         state.think_label = label + "…"
@@ -853,368 +1100,443 @@ def _start_think_labeller(state: AppState) -> None:
     threading.Thread(target=_run, daemon=True).start()
 
 
-class OllamaWorker:
-    """Streams an Ollama chat response on a background daemon thread.
+# ═══════════════════════════════════════════════════════════════════════════════
+# § 7  AgentWorker  — streaming agentic loop
+# ═══════════════════════════════════════════════════════════════════════════════
 
-    Supports tool calls (read / write / create / delete file).
-    Delete requires user confirmation via a canvas prompt before executing.
+_SPINNER = ["·", "✻", "✽", "✶", "✳", "✢", "✳", "✶", "✽", "✻"]
+
+
+class AgentWorker:
+    """
+    Streams Ollama responses on a background daemon thread.
+
+    Correct Ollama tool-calling loop (per official docs):
+        1. Call ollama.chat(..., think=True, stream=True)
+        2. Stream thinking tokens → show live; stream content tokens → show live
+        3. Collect tool_calls from stream chunks
+        4. Append the assembled assistant message to history  ← this is the key
+        5. Execute each tool call; append {"role":"tool","tool_name":fn,...} results
+        6. Call ollama.chat again with the same history — the model sees its own
+           prior tool calls and results and continues naturally. No injection needed.
+        7. Repeat until a turn produces no tool_calls.
     """
 
-    def __init__(self, state: AppState, canvas, root: Path) -> None:
-        self._state = state
-        self._canvas = canvas
-        self._root = root
+    _PENDING_VERB: Dict[str, str] = {
+        "read_file": "reading",
+        "write_file": "writing",
+        "create_file": "creating",
+        "delete_file": "deleting",
+        "run_command": "running",
+        "web_search": "searching",
+        "consult_critic": "reviewing plan",
+    }
+    _DONE_VERB: Dict[str, str] = {
+        "read_file": "read",
+        "write_file": "wrote",
+        "create_file": "created",
+        "delete_file": "deleted",
+        "run_command": "ran",
+        "web_search": "searched",
+        "consult_critic": "critic reviewed",
+    }
 
-    def start(self, messages: List[dict], system_prompt: str) -> None:
+    def __init__(self, state: AppState, canvas: Canvas, root: Path) -> None:
+        self._state  = state
+        self._canvas = canvas
+        self._root   = root
+        self._task   = ""  # current user request, echoed into every tool result
+
+    # ── Public API ────────────────────────────────────────────────────────────
+
+    def start(self, messages: List[dict], system_prompt: str, task: str = "") -> None:
+        self._task = task.strip()
         threading.Thread(
             target=self._run,
             args=(list(messages), system_prompt),
             daemon=True,
         ).start()
 
-    # ── Tool execution ───────────────────────────────────────────────────────
+    # ── Private: main loop ────────────────────────────────────────────────────
 
-    def _exec_tool(self, name: str, args: dict) -> str:
-        """Execute one tool call synchronously. Returns the result string."""
-        path = _safe_path(args.get("path", ""), self._root)
-        if path is None:
-            return "[ERROR] Path is outside the project directory."
+    def _run(self, messages: List[dict], system_prompt: str) -> None:
+        with self._state.lock:
+            self._state.tool_events = []
+            self._state.think_output = ""
+            self._state.current_output = ""
+            self._state.reply_started = False
+
+        # history is the single source of truth — no side-channel injections.
+        # The system prompt is prepended on every call; conversation messages live here.
+        history: List[dict] = list(messages)
+        think_acc: str = (
+            ""  # all thinking text accumulated across tool turns (display only)
+        )
+        output_acc: str = ""  # final visible reply
+
+        try:
+            while True:
+                if self._stopped():
+                    break
+
+                # Stream one model turn.  Returns the assembled assistant message
+                # dict that must be appended to history before executing tools.
+                content, think_chunk, tool_calls, asst_msg = self._stream_one_turn(
+                    history, system_prompt, think_acc
+                )
+                think_acc += think_chunk
+                output_acc = content
+
+                # Step 4: append the assistant message BEFORE touching tools.
+                # This is the correct Ollama pattern — the Message object (or an
+                # equivalent dict with role/content/thinking/tool_calls) goes into
+                # history so the next API call sees the full context.
+                history.append(asst_msg)
+
+                if not tool_calls:
+                    break  # final reply already being streamed
+
+                # Tool calls are coming — reset reply_started so the renderer
+                # doesn't treat preamble text as the final reply.
+                with self._state.lock:
+                    self._state.reply_started = False
+                    self._state.current_output = ""
+
+                # Steps 5–6: execute tools and append results
+                for tc in tool_calls:
+                    fn = tc.function.name
+                    args = tc.function.arguments  # already a dict from the Ollama lib
+                    if isinstance(args, str):
+                        try:
+                            args = json.loads(args)
+                        except:
+                            args = {}
+
+                    # Snapshot line count BEFORE mutation for accurate diff stat
+                    before_lines = self._snapshot_lines(fn, args)
+
+                    # Register PENDING event in state and think display
+                    event = self._push_tool_event(fn, args)
+                    pending_sentinel = f"\x00TOOL_PENDING\x00{event.label}…"
+                    think_acc += f"\n{pending_sentinel}"
+                    with self._state.lock:
+                        self._state.think_output = think_acc
+
+                    # Execute (may block on _confirm for delete/run_command)
+                    result = self._execute_tool(fn, args)
+
+                    # Compute stat, resolve event, update display
+                    stat = self._compute_stat(fn, args, before_lines)
+                    self._resolve_tool_event(event, result, stat)
+                    is_error = result.startswith("[ERROR]")
+                    done_sentinel = (
+                        f"\x00TOOL_ERROR\x00{event.label}"
+                        if is_error
+                        else f"\x00TOOL_DONE\x00{event.label}{stat}"
+                    )
+                    think_acc = (
+                        think_acc.replace(pending_sentinel, done_sentinel) + "\n"
+                    )
+                    with self._state.lock:
+                        self._state.think_output = think_acc
+
+                    # Append tool result to history.
+                    # Per Ollama docs the correct key is "tool_name", not "name".
+                    # Append the original task as a reminder at the end of every
+                    # tool result — this keeps it in the model's effective attention
+                    # range regardless of how much file content was just returned.
+                    task_reminder = self._task
+                    history.append(
+                        {
+                            "role": "tool",
+                            "tool_name": fn,
+                            "content": (
+                                result
+                                + f"\n\n[REMINDER: your task is: {task_reminder}]"
+                            ),
+                        }
+                    )
+
+                # Loop back — the history now contains the full context:
+                # prior turns, the assistant's tool_calls message, and all tool
+                # results.  No continuation prompt injection is needed or correct.
+
+        except Exception as exc:
+            output_acc = f"[ERROR] {exc}"
+            with self._state.lock:
+                self._state.current_output = output_acc
+
+        finally:
+            self._finalize(output_acc)
+
+    # ── Private: stream one model turn ───────────────────────────────────────
+
+    def _stream_one_turn(
+        self,
+        history: List[dict],
+        system_prompt: str,
+        think_acc_so_far: str,
+    ) -> Tuple[str, str, List[Any], dict]:
+        """
+        Stream one ollama.chat call, parsing <think>...</think> tags manually.
+        (think=True is not available in all SDK versions; tag parsing is reliable.)
+
+        Returns:
+            content          -- visible reply text accumulated this turn
+            thinking_chunk   -- thinking text accumulated this turn
+            tool_calls       -- deduplicated list of ToolCall objects (Ollama types)
+            asst_msg         -- assembled assistant message dict for history
+        """
+        thinking_chunk = ""
+        content = ""
+        tool_calls_raw: List[Any] = []
+        in_think = False
+
+        stream = ollama.chat(
+            model=_MODEL,
+            messages=[{"role": "system", "content": system_prompt}] + history,
+            tools=_TOOLS,
+            stream=True,
+        )
+
+        for chunk in stream:
+            if self._stopped():
+                break
+
+            msg = chunk.message
+            piece = msg.content or ""
+
+            if piece:
+                # ── <think> open ──────────────────────────────────────────────
+                if not in_think and "<think>" in piece:
+                    in_think = True
+                    with self._state.lock:
+                        self._state.think_start = time.time()
+                    piece = piece.split("<think>", 1)[1]
+
+                # ── </think> close ─────────────────────────────────────────────
+                if in_think and "</think>" in piece:
+                    before, _, after = piece.partition("</think>")
+                    thinking_chunk += before
+                    in_think = False
+                    with self._state.lock:
+                        self._state.think_duration = (
+                            time.time() - self._state.think_start
+                        )
+                        self._state.think_output = think_acc_so_far + thinking_chunk
+                    piece = after  # remainder is normal content
+
+                if in_think:
+                    thinking_chunk += piece
+                    with self._state.lock:
+                        self._state.think_output = think_acc_so_far + thinking_chunk
+                elif piece:
+                    content += piece
+                    with self._state.lock:
+                        self._state.current_output = content
+                        # First content token = final reply is streaming.
+                        # Will be reset to False if tool calls are found.
+                        self._state.reply_started = True
+
+            # tool calls arrive as complete objects, not token-by-token
+            if msg.tool_calls:
+                tool_calls_raw.extend(msg.tool_calls)
+
+        # Guard: model thought but never closed the tag (shouldn't happen normally)
+        if in_think:
+            with self._state.lock:
+                self._state.think_duration = time.time() - self._state.think_start
+                self._state.think_output = think_acc_so_far + thinking_chunk
+
+        # Deduplicate tool calls — streaming can deliver the same call twice
+        seen: set = set()
+        unique: List[Any] = []
+        for tc in tool_calls_raw:
+            key = (tc.function.name, str(tc.function.arguments))
+            if key not in seen:
+                seen.add(key)
+                unique.append(tc)
+
+        # Build the history entry.
+        # qwen3 was trained to see its own reasoning as <think>...</think> inside
+        # the content field.  Storing it under a separate "thinking" key means the
+        # model has no memory of what it already did when the next turn starts, so
+        # it restarts from step 1.  Embedding it in content in the exact format the
+        # model emitted preserves full context across tool-call turns.
+        if thinking_chunk:
+            history_content = f"<think>\n{thinking_chunk}\n</think>\n{content}"
+        else:
+            history_content = content
+        asst_msg: dict = {"role": "assistant", "content": history_content}
+        if unique:
+            asst_msg["tool_calls"] = [
+                {
+                    "function": {
+                        "name": tc.function.name,
+                        "arguments": tc.function.arguments,
+                    }
+                }
+                for tc in unique
+            ]
+
+        return content, thinking_chunk, unique, asst_msg
+
+    # ── Private: tool execution ───────────────────────────────────────────────
+
+    def _execute_tool(self, name: str, args: dict) -> str:
+        """Dispatch one tool call.  Path is resolved fresh per branch so that
+        Pyright can narrow Path | None -> Path after each None-guard."""
+
+        def _resolve(rel: str) -> "Optional[Path]":
+            return _safe_path(rel, self._root) if rel else None
 
         if name == "read_file":
-            if not path.exists():
-                return f"[ERROR] File not found: {args['path']}"
-            try:
-                return path.read_text(encoding="utf-8")
-            except Exception as e:
-                return f"[ERROR] {e}"
+            rel = args.get("path", "")
+            path = _resolve(rel)
+            if path is None:
+                return "[ERROR] Path is outside the project directory."
+            start = int(args["start_line"]) if "start_line" in args else 1
+            end   = int(args["end_line"])   if "end_line"   in args else None
+            return _tool_read_file(path, rel, start, end)
+
+        elif name == "search_file":
+            rel = args.get("path", "")
+            path = _resolve(rel)
+            if path is None:
+                return "[ERROR] Path is outside the project directory."
+            pattern = args.get("pattern", "")
+            if not pattern:
+                return "[ERROR] No pattern provided."
+            ctx = int(args["context_lines"]) if "context_lines" in args else 3
+            return _tool_search_file(path, rel, pattern, ctx)
 
         elif name == "write_file":
-            if not path.exists():
-                return f"[ERROR] File does not exist (use create_file to make a new file): {args['path']}"
-            try:
-                path.write_text(args.get("content", ""), encoding="utf-8")
-                return f"OK: wrote {path.stat().st_size} bytes to {args['path']}"
-            except Exception as e:
-                return f"[ERROR] {e}"
+            rel = args.get("path", "")
+            path = _resolve(rel)
+            if path is None:
+                return "[ERROR] Path is outside the project directory."
+            if not str(path).startswith(str(self._root)):
+                return "[ERROR] write_file is restricted to the project directory."
+            return _tool_write_file(path, rel, args.get("content", ""))
 
         elif name == "create_file":
-            if path.exists():
-                return f"[ERROR] File already exists: {args['path']}"
-            try:
-                path.parent.mkdir(parents=True, exist_ok=True)
-                path.write_text(args.get("content", ""), encoding="utf-8")
-                return f"OK: created {args['path']}"
-            except Exception as e:
-                return f"[ERROR] {e}"
+            rel = args.get("path", "")
+            path = _resolve(rel)
+            if path is None:
+                return "[ERROR] Path is outside the project directory."
+            if not str(path).startswith(str(self._root)):
+                return "[ERROR] create_file is restricted to the project directory."
+            return _tool_create_file(path, rel, args.get("content", ""))
 
         elif name == "delete_file":
-            if not path.exists():
-                return f"[ERROR] File not found: {args['path']}"
-            # Pause generation briefly to get user confirmation on the main thread.
-            # We communicate via a threading.Event + shared slot.
-            confirmed = self._confirm_delete(args["path"])
-            if confirmed:
-                try:
-                    path.unlink()
-                    return f"OK: deleted {args['path']}"
-                except Exception as e:
-                    return f"[ERROR] {e}"
-            else:
+            rel = args.get("path", "")
+            path = _resolve(rel)
+            if path is None:
+                return "[ERROR] Path is outside the project directory."
+            if not str(path).startswith(str(self._root)):
+                return "[ERROR] delete_file is restricted to the project directory."
+            if not self._confirm(f"Delete '{rel}'? [y/N]: "):
                 return "CANCELLED: user declined deletion."
+            return _tool_delete_file(path, rel)
+
+        elif name == "run_command":
+            cmd = args.get("command", "").strip()
+            if not cmd:
+                return "[ERROR] No command provided."
+            # cwd is always the project root — the AI must not change it
+            if not self._confirm(f"Run: {cmd}  [y/N]: "):
+                return "CANCELLED: user declined command."
+            return _tool_run_command(cmd, self._root)
 
         elif name == "web_search":
             query = args.get("query", "").strip()
             if not query:
                 return "[ERROR] No query provided."
-            return _web_search(query)
+            return _tool_web_search(query)
 
         elif name == "consult_critic":
             plan = args.get("plan", "").strip()
             if not plan:
                 return "[ERROR] No plan provided."
-            return _consult_critic(plan)
+            return _tool_consult_critic(plan)
 
         return f"[ERROR] Unknown tool: {name}"
 
-    def _confirm_delete(self, rel: str) -> bool:
-        """Block the worker thread until the main thread confirms or denies."""
-        result_holder: List[Optional[bool]] = [None]
-        done = threading.Event()
+    # ── Private: tool state helpers ───────────────────────────────────────────
 
-        def _ask():
-            import termios, tty as _tty
-
-            fd = sys.stdin.fileno()
-            cooked = termios.tcgetattr(fd)
-            termios.tcsetattr(fd, termios.TCSANOW, cooked)
-            answer = (
-                (self._canvas.read_line(f"Delete {rel}? [y/N]: ") or "").strip().lower()
-            )
-            # Restore cbreak
-            _tty.setcbreak(fd, termios.TCSANOW)
-            result_holder[0] = answer in ("y", "yes")
-            done.set()
-
-        threading.Thread(target=_ask, daemon=True).start()
-        done.wait()
-        return bool(result_holder[0])
-
-    # ── Main run loop ────────────────────────────────────────────────────────
-
-    def _run(self, messages: List[dict], system_prompt: str) -> None:
-        import json as _json
-
-        output = ""
-        think_text = ""
-        thinking = False
-        tool_messages: List[dict] = list(messages)
-
+    def _push_tool_event(self, fn: str, args: dict) -> ToolEvent:
+        rel = args.get("path", "") or args.get("query", "") or args.get("command", "")
+        label = f"{self._DONE_VERB.get(fn, fn)} {rel}".strip()
+        event = ToolEvent(name=fn, label=label, status=ToolStatus.PENDING)
         with self._state.lock:
-            self._state.last_turn_tools = []
+            self._state.tool_events.append(event)
+        return event
 
-        def _push_status(text: str) -> None:
-            with self._state.lock:
-                self._state.current_output = text
+    def _resolve_tool_event(self, event: ToolEvent, result: str, stat: str) -> None:
+        event.status = (
+            ToolStatus.ERROR if result.startswith("[ERROR]") else ToolStatus.DONE
+        )
+        event.stat = stat
 
+    def _snapshot_lines(self, fn: str, args: dict) -> Optional[int]:
+        """Return the current line count of the target file BEFORE mutation."""
+        if fn not in ("read_file", "write_file", "create_file", "delete_file"):
+            return None
+        path = _safe_path(args.get("path", ""), self._root)
+        if path is None or not path.exists():
+            return 0
         try:
-            while True:
-                with self._state.lock:
-                    if self._state.stop_requested:
-                        break
+            return len(path.read_text(encoding="utf-8").splitlines())
+        except Exception:
+            return 0
 
-                response = ollama.chat(
-                    _MODEL,
-                    [{"role": "system", "content": system_prompt}] + tool_messages,
-                    tools=_TOOLS,
-                    stream=True,
-                )
+    def _compute_stat(self, fn: str, args: dict, before_lines: Optional[int]) -> str:
+        """Compute diff stat using the pre-captured before_lines snapshot."""
+        if before_lines is None:
+            return ""
+        path = _safe_path(args.get("path", ""), self._root)
+        return _diff_stat(path, before_lines, fn)
 
-                # Accumulate the full streamed response to inspect for tool calls
-                full_content = ""
-                tool_calls_acc: List[Any] = []
+    # ── Private: finalisation ─────────────────────────────────────────────────
 
-                for token in response:
-                    with self._state.lock:
-                        if self._state.stop_requested:
-                            break
+    def _finalize(self, output: str) -> None:
+        with self._state.lock:
+            if output and not output.startswith("[ERROR]"):
+                self._state.messages.append({"role": "assistant", "content": output})
+            self._state.last_turn_tools = list(self._state.tool_events)
+            self._state.current_output = ""
+            self._state.think_output = ""
+            self._state.think_label = "thinking…"
+            self._state.scroll_offset = 0
+            self._state.stop_requested = False
+            self._state.model_busy = False
+            messages_snapshot = list(self._state.messages)
 
-                    msg = token.message
+        _notify_async(_MODEL, messages_snapshot)
 
-                    # Stream text tokens to the display
-                    chunk = msg.content or ""
-                    if chunk:
-                        if "<think>" in chunk:
-                            thinking = True
-                            with self._state.lock:
-                                self._state.think_start_time = time.time()
-                        if "</think>" in chunk:
-                            thinking = False
-                            with self._state.lock:
-                                self._state.think_duration = (
-                                    time.time() - self._state.think_start_time
-                                )
-                            chunk = re.sub(r".*</think>", "", chunk, flags=re.DOTALL)
+    # ── Private: utilities ────────────────────────────────────────────────────
 
-                        if thinking:
-                            think_text += chunk
-                            with self._state.lock:
-                                self._state.think_output = think_text
-                        else:
-                            full_content += chunk
-                            output = full_content
-                            with self._state.lock:
-                                self._state.current_output = full_content
+    def _stopped(self) -> bool:
+        with self._state.lock:
+            return self._state.stop_requested
 
-                    # Collect tool calls streamed in this token
-                    if hasattr(msg, "tool_calls") and msg.tool_calls:
-                        for tc in msg.tool_calls:
-                            tool_calls_acc.append(tc)
-
-                # If no tool calls, we're done
-                if not tool_calls_acc:
-                    break
-
-                # Deduplicate tool calls (streaming may repeat them) and serialize to dicts
-                seen: set = set()
-                unique_tcs: List[Any] = []
-                for tc in tool_calls_acc:
-                    key = (tc.function.name, str(tc.function.arguments))
-                    if key not in seen:
-                        seen.add(key)
-                        unique_tcs.append(tc)
-                tool_calls_acc = unique_tcs
-
-                # Serialize ToolCall objects → plain dicts for the message history
-                tc_dicts = []
-                for tc in tool_calls_acc:
-                    raw_args = tc.function.arguments
-                    if isinstance(raw_args, str):
-                        try:
-                            raw_args = _json.loads(raw_args)
-                        except Exception:
-                            raw_args = {}
-                    tc_dicts.append(
-                        {"function": {"name": tc.function.name, "arguments": raw_args}}
-                    )
-
-                tool_messages.append(
-                    {
-                        "role": "assistant",
-                        "content": full_content,
-                        "tool_calls": tc_dicts,
-                    }
-                )
-
-                for tc_d in tc_dicts:
-                    fn = tc_d["function"]["name"]
-                    args = tc_d["function"]["arguments"]
-                    if isinstance(args, str):
-                        try:
-                            args = _json.loads(args)
-                        except Exception:
-                            args = {}
-
-                    verb = {
-                        "read_file": "reading",
-                        "write_file": "writing",
-                        "create_file": "creating",
-                        "delete_file": "deleting",
-                        "web_search": "searching",
-                        "consult_critic": "consulting critic",
-                    }.get(fn, fn)
-                    done_verb = {
-                        "read_file": "read",
-                        "write_file": "wrote",
-                        "create_file": "created",
-                        "delete_file": "deleted",
-                        "web_search": "searched",
-                        "consult_critic": "critic reviewed",
-                    }.get(fn, fn)
-                    rel = args.get("path", "") or args.get("query", "")
-                    pending_sentinel = f"\x00TOOL_PENDING\x00{verb} {rel}…"
-
-                    # Snapshot line count before mutation for diff display
-                    _diff_str = ""
-                    if fn in ("write_file", "create_file", "delete_file", "read_file"):
-                        _fpath = _safe_path(args.get("path", ""), self._root)
-                        try:
-                            _before = (
-                                len(_fpath.read_text(encoding="utf-8").splitlines())
-                                if _fpath and _fpath.exists()
-                                else 0
-                            )
-                        except Exception:
-                            _before = 0
-                    else:
-                        _before = None
-
-                    # Inject pending marker into think stream
-                    with self._state.lock:
-                        self._state.think_output = think_text + f"\n{pending_sentinel}"
-
-                    result = self._exec_tool(fn, args)
-
-                    # Compute diff stat after exec
-                    if _before is not None:
-                        _fpath2 = _safe_path(args.get("path", ""), self._root)
-                        try:
-                            _after = (
-                                len(_fpath2.read_text(encoding="utf-8").splitlines())
-                                if _fpath2 and _fpath2.exists()
-                                else 0
-                            )
-                        except Exception:
-                            _after = 0
-                        _added = max(0, _after - _before)
-                        _removed = max(0, _before - _after)
-                        if fn == "read_file":
-                            _diff_str = f"  {_before}L"
-                        elif fn == "delete_file" and _removed > 0:
-                            _diff_str = f"  -{_removed}"
-                        elif _added > 0 or _removed > 0:
-                            parts = []
-                            if _added:
-                                parts.append(f"+{_added}")
-                            if _removed:
-                                parts.append(f"-{_removed}")
-                            _diff_str = "  " + " ".join(parts)
-
-                    done_sentinel = f"\x00TOOL_DONE\x00{done_verb} {rel}{_diff_str}"
-                    error_sentinel = f"\x00TOOL_ERROR\x00{done_verb} {rel}"
-
-                    # Replace pending marker with done/error marker in place
-                    is_error = result.startswith("[ERROR]")
-                    sentinel = error_sentinel if is_error else done_sentinel
-                    think_text += f"\n{sentinel}\n"
-                    with self._state.lock:
-                        self._state.think_output = think_text
-                        if not is_error:
-                            self._state.last_turn_tools.append(
-                                (f"{done_verb} {rel}{_diff_str}", True)
-                            )
-
-                    tool_messages.append(
-                        {
-                            "role": "tool",
-                            "content": result,
-                            "name": fn,
-                        }
-                    )
-
-                # Loop for the next model turn.
-                # Inject the prior reasoning so the model continues rather than restarts.
-                clean_prior = re.sub(r"</?think>", "", think_text)
-                clean_prior = re.sub(
-                    r"\x00TOOL_(?:PENDING|DONE)\x00[^\n]*", "", clean_prior
-                )
-                clean_prior = clean_prior.strip()
-                if clean_prior:
-                    tool_messages.append(
-                        {
-                            "role": "user",
-                            "content": (
-                                "**YOU ARE IN THE MIDDLE OF THINKING**\n"
-                                "HERE ARE YOUR PREVIOUS THOUGHTS:\n"
-                                f"<prior_thinking>\n{clean_prior}\n</prior_thinking>\n\n"
-                                "The tool results are above. "
-                                "Check if your task has been achieved by the previous tool usage, if yes **STOP THINKING**. "
-                                "Continue your reasoning from where you left off. "
-                                "DO NOT restart from step 1. DO NOT re-read files you already read. "
-                                "Use what you already know and proceed directly to the next step. "
-                                "MAKE SURE TO CHECK IF YOU HAVE EXECUTED A TOOL BEFORE, DO NOT REPEAT YOURSELF!!!"
-                            ),
-                        }
-                    )
-
-        except Exception as exc:
-            output = f"[ERROR] {exc}"
-            with self._state.lock:
-                self._state.current_output = output
-
-        finally:
-            with self._state.lock:
-                if output and not output.startswith("[ERROR]"):
-                    self._state.messages.append(
-                        {"role": "assistant", "content": output}
-                    )
-                self._state.current_output = ""
-                self._state.think_output = ""
-                self._state.think_label = "thinking…"
-                self._state.scroll_offset = 0
-                self._state.stop_requested = False
-                self._state.model_busy = False
-                messages_snapshot = list(self._state.messages)
-
-            _summarize_and_notify(_MODEL, messages_snapshot)
+    def _confirm(self, prompt: str) -> bool:
+        """Post a ConfirmRequest to AppState and block until the main
+        event loop resolves it.  The main thread owns the terminal, so
+        all input handling happens there — no side-thread tty juggling."""
+        req = ConfirmRequest(prompt=prompt)
+        with self._state.lock:
+            self._state.confirm_request = req
+        req.event.wait()  # main loop sets req.result and signals this
+        return bool(req.result)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# Renderer
+# § 8  Renderer
 # ═══════════════════════════════════════════════════════════════════════════════
 
 
 def _wrap_lines(text: str, width: int) -> List[str]:
-    """Split *text* into lines no wider than *width*, honouring newlines."""
     result: List[str] = []
     for paragraph in text.split("\n"):
         if not paragraph:
@@ -1228,38 +1550,24 @@ def _wrap_lines(text: str, width: int) -> List[str]:
 
 
 def _shimmer_line(text: str, tick: int, speed: float = 0.2, band: int = 10) -> str:
-    """Return a markup string for *text* with a left-to-right shimmer sweep.
-
-    A bright band travels across the full line width every ~3 s at the default
-    speed. Characters inside the band are lit to rgb(195,195,195); outside they
-    stay at rgb(100,100,100).
-    """
+    """Left-to-right shimmer sweep over *text*."""
     if not text:
         return ""
-
-    total = len(text) + band  # shimmer travels over text + off-screen tail
-    pos = (tick * speed) % total  # current leading edge of the bright band
-
+    total = len(text) + band
+    pos = (tick * speed) % total
     out: List[str] = []
-    prev_r, prev_g, prev_b = -1, -1, -1
-
+    prev = (-1, -1, -1)
     for i, ch in enumerate(text):
         dist = pos - i
         if 0 <= dist < band:
-            # smooth falloff: brightest at dist == band/2
             t = 1.0 - abs(dist - band / 2) / (band / 2)
-            r = int(100 + 95 * t)
-            g = int(100 + 95 * t)
-            b = int(100 + 95 * t)
+            r = g = b = int(100 + 95 * t)
         else:
-            r, g, b = 100, 100, 100
-
-        if (r, g, b) != (prev_r, prev_g, prev_b):
+            r = g = b = 100
+        if (r, g, b) != prev:
             out.append(f"%color({r},{g},{b})")
-            prev_r, prev_g, prev_b = r, g, b
-
+            prev = (r, g, b)
         out.append(ch)
-
     return "".join(out)
 
 
@@ -1408,6 +1716,76 @@ _SH_KW: dict = {
         "shift",
         "exit",
     },
+    "rust": {
+        "as",
+        "async",
+        "await",
+        "break",
+        "const",
+        "continue",
+        "crate",
+        "dyn",
+        "else",
+        "enum",
+        "extern",
+        "false",
+        "fn",
+        "for",
+        "if",
+        "impl",
+        "in",
+        "let",
+        "loop",
+        "match",
+        "mod",
+        "move",
+        "mut",
+        "pub",
+        "ref",
+        "return",
+        "self",
+        "Self",
+        "static",
+        "struct",
+        "super",
+        "trait",
+        "true",
+        "type",
+        "union",
+        "unsafe",
+        "use",
+        "where",
+        "while",
+        "i8",
+        "i16",
+        "i32",
+        "i64",
+        "i128",
+        "isize",
+        "u8",
+        "u16",
+        "u32",
+        "u64",
+        "u128",
+        "usize",
+        "f32",
+        "f64",
+        "bool",
+        "char",
+        "str",
+        "String",
+        "Option",
+        "Result",
+        "Some",
+        "None",
+        "Ok",
+        "Err",
+        "Vec",
+        "Box",
+        "Arc",
+        "Rc",
+        "HashMap",
+    },
     "zig": {
         "addrspace",
         "align",
@@ -1463,180 +1841,11 @@ _SH_KW: dict = {
         "null",
         "undefined",
     },
-    "rust": {
-        "as",
-        "async",
-        "await",
-        "break",
-        "const",
-        "continue",
-        "crate",
-        "dyn",
-        "else",
-        "enum",
-        "extern",
-        "false",
-        "fn",
-        "for",
-        "if",
-        "impl",
-        "in",
-        "let",
-        "loop",
-        "match",
-        "mod",
-        "move",
-        "mut",
-        "pub",
-        "ref",
-        "return",
-        "self",
-        "Self",
-        "static",
-        "struct",
-        "super",
-        "trait",
-        "true",
-        "type",
-        "union",
-        "unsafe",
-        "use",
-        "where",
-        "while",
-        "abstract",
-        "become",
-        "box",
-        "do",
-        "final",
-        "macro",
-        "override",
-        "priv",
-        "try",
-        "typeof",
-        "unsized",
-        "virtual",
-        "yield",
-        "i8",
-        "i16",
-        "i32",
-        "i64",
-        "i128",
-        "isize",
-        "u8",
-        "u16",
-        "u32",
-        "u64",
-        "u128",
-        "usize",
-        "f32",
-        "f64",
-        "bool",
-        "char",
-        "str",
-        "String",
-        "Option",
-        "Result",
-        "Some",
-        "None",
-        "Ok",
-        "Err",
-        "Vec",
-        "Box",
-        "Arc",
-        "Rc",
-        "HashMap",
-    },
-    "php": {
-        "abstract",
-        "and",
-        "array",
-        "as",
-        "break",
-        "callable",
-        "case",
-        "catch",
-        "class",
-        "clone",
-        "const",
-        "continue",
-        "declare",
-        "default",
-        "do",
-        "echo",
-        "else",
-        "elseif",
-        "empty",
-        "enddeclare",
-        "endfor",
-        "endforeach",
-        "endif",
-        "endswitch",
-        "endwhile",
-        "enum",
-        "extends",
-        "final",
-        "finally",
-        "fn",
-        "for",
-        "foreach",
-        "function",
-        "global",
-        "goto",
-        "if",
-        "implements",
-        "include",
-        "include_once",
-        "instanceof",
-        "insteadof",
-        "interface",
-        "isset",
-        "list",
-        "match",
-        "namespace",
-        "new",
-        "or",
-        "print",
-        "private",
-        "protected",
-        "public",
-        "readonly",
-        "require",
-        "require_once",
-        "return",
-        "static",
-        "switch",
-        "throw",
-        "trait",
-        "try",
-        "unset",
-        "use",
-        "var",
-        "while",
-        "xor",
-        "yield",
-        "true",
-        "false",
-        "null",
-        "TRUE",
-        "FALSE",
-        "NULL",
-        "int",
-        "float",
-        "string",
-        "bool",
-        "void",
-        "array",
-        "object",
-        "mixed",
-    },
 }
 _SH_KW["py"] = _SH_KW["python"]
 _SH_KW["cpp"] = _SH_KW["c"]
-_SH_KW["javascript"] = _SH_KW["js"]
-_SH_KW["typescript"] = _SH_KW["js"]
-_SH_KW["ts"] = _SH_KW["js"]
-_SH_KW["bash"] = _SH_KW["sh"]
-_SH_KW["zsh"] = _SH_KW["sh"]
+_SH_KW["javascript"] = _SH_KW["ts"] = _SH_KW["typescript"] = _SH_KW["js"]
+_SH_KW["bash"] = _SH_KW["zsh"] = _SH_KW["sh"]
 
 _CH_DEFAULT = Theme.SYN_DEFAULT
 _CH_KW = Theme.SYN_KEYWORD
@@ -1647,20 +1856,14 @@ _CH_GUTTER = Theme.SYN_GUTTER
 
 
 def _highlight_line(line: str, lang: str) -> str:
-    """Return a markup string for one raw line of code."""
     kw = _SH_KW.get(lang.lower(), set())
     out: List[str] = [_CH_DEFAULT]
     i, n = 0, len(line)
-
     while i < n:
         ch = line[i]
-
-        # Line comments: #  //  --
         if ch == "#" or line[i : i + 2] in ("//", "--"):
             out.append(_CH_COMMENT + line[i:])
             break
-
-        # String literals (single/double quote, triple quotes)
         if ch in ('"', "'"):
             q = line[i : i + 3] if line[i : i + 3] in ('"""', "'''") else ch
             j = i + len(q)
@@ -1675,8 +1878,6 @@ def _highlight_line(line: str, lang: str) -> str:
             out += [_CH_STR, line[i:j], _CH_DEFAULT]
             i = j
             continue
-
-        # Numbers
         if ch.isdigit():
             j = i + 1
             while j < n and (line[j].isdigit() or line[j] in ".xXabcdefABCDEF_"):
@@ -1684,30 +1885,21 @@ def _highlight_line(line: str, lang: str) -> str:
             out += [_CH_NUM, line[i:j], _CH_DEFAULT]
             i = j
             continue
-
-        # Identifiers / keywords
         if ch.isalpha() or ch == "_":
             j = i + 1
             while j < n and (line[j].isalnum() or line[j] == "_"):
                 j += 1
             word = line[i:j]
-            if word in kw:
-                out += [_CH_KW, word, _CH_DEFAULT]
-            else:
-                out.append(word)
+            out += [_CH_KW, word, _CH_DEFAULT] if word in kw else [word]
             i = j
             continue
-
         out.append(ch)
         i += 1
-
     return "".join(out)
 
 
 def _split_code_blocks(content: str):
-    """Yield (is_code, lang, text) tuples, handling unclosed fences."""
-    fence = "```"
-    i = 0
+    fence, i = "```", 0
     while i < len(content):
         fi = content.find(fence, i)
         if fi == -1:
@@ -1728,10 +1920,8 @@ def _split_code_blocks(content: str):
 
 
 def _message_lines(content: str, width: int) -> List[str]:
-    """Convert assistant message text to display lines with code highlighting."""
     lines: List[str] = []
     code_w = max(width - 2, 10)
-
     for is_code, lang, text in _split_code_blocks(content):
         if is_code:
             for raw in text.rstrip("\n").split("\n"):
@@ -1744,18 +1934,75 @@ def _message_lines(content: str, width: int) -> List[str]:
         else:
             for line in _wrap_lines(text, width):
                 lines.append(line)
-
     return lines
 
 
+def _colour_stat(stat: str) -> str:
+    """Colour +N/-N stat tokens for display."""
+    if not stat.strip():
+        return ""
+    out: List[str] = []
+    for tok in stat.split():
+        if tok.startswith("+"):
+            out.append(f" {Theme.DIFF_ADD}{tok}%reset")
+        elif tok.startswith("-"):
+            out.append(f" {Theme.DIFF_DEL}{tok}%reset")
+        else:
+            out.append(f" {Theme.DIFF_NEUTRAL}{tok}%reset")
+    return "".join(out)
+
+
+def _render_think_event(kind: str, text: str) -> str:
+    """Format one line in the think block."""
+    if kind == "pending":
+        return f"{Theme.THINK_PENDING}◎%reset {Theme.THINK_PENDING_T}{text}"
+    if kind == "error":
+        return f"{Theme.THINK_ERROR}✘%reset {Theme.THINK_ERROR}{text}%reset"
+    if kind == "done":
+        m = re.search(r"(  [+\-\d L]+)$", text)
+        if m:
+            base, stat = text[: m.start()], m.group(1)
+            return f"{Theme.THINK_DONE}✔%reset {Theme.THINK_DONE_T}{base}{_colour_stat(stat)}"
+        return f"{Theme.THINK_DONE}✔%reset {Theme.THINK_DONE_T}{text}"
+    return Theme.THINK_TEXT + text
+
+
+def _parse_think_display_lines(
+    think_text: str, wrap_width: int
+) -> List[Tuple[str, str]]:
+    """
+    Convert raw think_output (with sentinel markers) into a list of
+    (kind, text) tuples ready for rendering.
+    kind ∈ {"text", "pending", "done", "error"}
+    """
+    clean = re.sub(r"</?think>", "", think_text)
+    rows: List[Tuple[str, str]] = []
+    for line in clean.split("\n"):
+        if line.startswith("\x00TOOL_PENDING\x00"):
+            rows.append(("pending", line[len("\x00TOOL_PENDING\x00") :]))
+        elif line.startswith("\x00TOOL_DONE\x00"):
+            rows.append(("done", line[len("\x00TOOL_DONE\x00") :]))
+            rows.append(("text", ""))
+        elif line.startswith("\x00TOOL_ERROR\x00"):
+            rows.append(("error", line[len("\x00TOOL_ERROR\x00") :]))
+            rows.append(("text", ""))
+        else:
+            for wrapped in (
+                _wrap_lines(line.strip(), wrap_width) if line.strip() else [""]
+            ):
+                rows.append(("text", wrapped))
+    # Drop leading blank lines
+    while rows and rows[0] == ("text", ""):
+        rows.pop(0)
+    return rows
+
+
 def render_frame(canvas: Canvas, state: AppState, tick: int) -> None:
-    """Build one frame inside *canvas* from the current *state*."""
     W = canvas.width
     H = canvas.height
-    CONTENT_W = W - 4  # usable text width (2 chars padding each side)
-    # User bubble zone: starts at 40% of canvas, ends 1 char from right border
-    USER_ZONE_START = int(W * 0.4)
-    USER_W = W - 3 - USER_ZONE_START  # wrap width for user text
+    CONTENT_W = W - 4
+    USER_ZONE_X = int(W * 0.4)
+    USER_W = W - 3 - USER_ZONE_X
     THINK_ROWS = 3
     STATUS_ROW = H - 1
 
@@ -1764,129 +2011,97 @@ def render_frame(canvas: Canvas, state: AppState, tick: int) -> None:
         current = state.current_output
         think_text = state.think_output
         think_dur = state.think_duration
-        think_start = state.think_start_time
+        think_start = state.think_start
         last_turn_tools = list(state.last_turn_tools)
         busy = state.model_busy
         scroll = state.scroll_offset
-        show_thinking = state.show_thinking
+        think_mode = state.think_mode
         think_label = state.think_label
         think_scroll = state.think_scroll
+        reply_started = state.reply_started
 
     username = getpass.getuser()
 
-    # ── Identify last assistant message index ─────────────────────────────
+    # ── Find last assistant message index ─────────────────────────────────
     last_asst_idx = max(
         (i for i, m in enumerate(messages) if m["role"] == "assistant"),
         default=-1,
     )
 
-    # all_lines stores (x_offset, markup_text) tuples
+    # ── Build all chat lines ───────────────────────────────────────────────
+    # Each entry: (x_offset, markup_text)
     all_lines: List[Tuple[int, str]] = []
 
     for idx, msg in enumerate(messages):
         is_user = msg["role"] == "user"
 
-        # Header line: username (right-aligned) or model name (left)
+        # Header
         if is_user:
-            hdr_x = max(W - 3 - len(username), USER_ZONE_START)
+            hdr_x = max(W - 3 - len(username), USER_ZONE_X)
             all_lines.append((hdr_x, Theme.USER_HEADER + username))
         else:
             all_lines.append((1, Theme.ASST_HEADER + _MODEL))
 
-        # "thought for X s." + tool log after the last assistant message
+        # "thought for Xs." + tool log (shown after the last assistant reply)
         if idx == last_asst_idx and think_dur > 0 and not busy:
             secs = f"{think_dur:.1f}"
             all_lines.append((1, f"{Theme.ASST_THOUGHT}│ thought for {secs}s."))
-            for label, done in last_turn_tools:
+            for ev in last_turn_tools:
                 sym = (
                     f"{Theme.THINK_DONE}✔%reset"
-                    if done
-                    else f"{Theme.THINK_PENDING}◎%reset"
+                    if ev.status == ToolStatus.DONE
+                    else f"{Theme.THINK_ERROR}✘%reset"
                 )
-                # Colour diff stat tokens
-                parts = label.rsplit("  ", 1)
-                if len(parts) == 2:
-                    base, stat = parts
-                    coloured = ""
-                    for tok in stat.split():
-                        if tok.startswith("+"):
-                            coloured += f" {Theme.DIFF_ADD}{tok}%reset"
-                        elif tok.startswith("-"):
-                            coloured += f" {Theme.DIFF_DEL}{tok}%reset"
-                        else:
-                            coloured += f" {Theme.DIFF_NEUTRAL}{tok}%reset"
-                    all_lines.append(
-                        (
-                            1,
-                            f"{Theme.ASST_THOUGHT}│%reset  {sym} {Theme.THINK_DONE_T}{base}{coloured}",
-                        )
+                coloured_stat = _colour_stat(ev.stat)
+                all_lines.append(
+                    (
+                        1,
+                        f"{Theme.ASST_THOUGHT}│%reset  {sym} {Theme.THINK_DONE_T}{ev.label}{coloured_stat}",
                     )
-                else:
-                    all_lines.append(
-                        (
-                            1,
-                            f"{Theme.ASST_THOUGHT}│%reset  {sym} {Theme.THINK_DONE_T}{label}",
-                        )
-                    )
+                )
 
+        # Message body
         if is_user:
-            content_lines = _wrap_lines(msg["content"], USER_W)
-            for line in content_lines:
+            for line in _wrap_lines(msg["content"], USER_W):
                 line = line.strip()
-                line_x = max(W - 3 - len(line), USER_ZONE_START)
+                line_x = max(W - 3 - len(line), USER_ZONE_X)
                 all_lines.append((line_x, Theme.USER_TEXT + line))
         else:
             for line in _message_lines(msg["content"], CONTENT_W):
                 all_lines.append((1, line))
 
-        all_lines.append((1, ""))  # blank line between turns
+        all_lines.append((1, ""))  # blank separator
 
-    # In-progress assistant reply (streaming)
+    # In-progress streaming reply.
+    # reply_started is only True once we know there are no tool calls,
+    # so the model name never appears during think blocks or tool execution.
     if current:
-        all_lines.append((1, Theme.ASST_HEADER + _MODEL))
+        if reply_started:
+            all_lines.append((1, Theme.ASST_HEADER + _MODEL))
         for line in _message_lines(current, CONTENT_W):
             all_lines.append((1, line))
 
-    # ── Pre-compute think block size so chat layout can avoid it ─────────
+    # Auto-hide: only when reply_started, meaning the final reply is streaming.
+    if reply_started and think_mode > 0:
+        think_mode = 0
+
+    # ── Pre-compute think block dimensions ────────────────────────────────
+    _has_think = busy and bool(think_text)
+    think_display_lines: List[Tuple[str, str]] = []
     think_rows_reserved = 0
-    think_lines_expanded: List[Tuple[str, str]] = (
-        []
-    )  # (kind, text): kind ∈ "text","pending","done"
 
-    _has_think_block = busy and bool(think_text)
+    if _has_think:
+        think_display_lines = _parse_think_display_lines(think_text, W - 6)
+        if think_mode == 2:  # expanded
+            think_rows_reserved = min(len(think_display_lines) + 1, H - 4)
+        elif think_mode == 1:  # collapsed (3 lines + header)
+            content_rows = min(THINK_ROWS, len(think_display_lines))
+            think_rows_reserved = content_rows + 1 if content_rows else 1
+        else:  # hidden (header only)
+            think_rows_reserved = 1
 
-    if _has_think_block:
-        clean = re.sub(r"</?think>", "", think_text)
-        raw: List[Tuple[str, str]] = []
-        for line in clean.split("\n"):
-            if line.startswith("\x00TOOL_PENDING\x00"):
-                raw.append(("pending", line[len("\x00TOOL_PENDING\x00") :]))
-            elif line.startswith("\x00TOOL_DONE\x00"):
-                raw.append(("done", line[len("\x00TOOL_DONE\x00") :]))
-                raw.append(("text", ""))  # blank line after tool action
-            elif line.startswith("\x00TOOL_ERROR\x00"):
-                raw.append(("error", line[len("\x00TOOL_ERROR\x00") :]))
-                raw.append(("text", ""))  # blank line after tool action
-            else:
-                for wrapped in (
-                    _wrap_lines(line.strip(), W - 6) if line.strip() else [""]
-                ):
-                    raw.append(("text", wrapped))
-
-        # Drop leading blank text lines
-        while raw and raw[0] == ("text", ""):
-            raw.pop(0)
-
-        think_lines_expanded = raw
-
-        if show_thinking:
-            think_rows_reserved = min(len(raw) + 1, H - 4)  # +1 for header
-        else:
-            think_rows_reserved = min(THINK_ROWS, len(raw)) if raw else 0
-
-    # ── Layout: reserve rows for think block + status bar ─────────────────
+    # ── Chat scrolling / layout ───────────────────────────────────────────
     visible_rows = STATUS_ROW - think_rows_reserved
-
     total = len(all_lines)
     if total > visible_rows:
         max_scroll = total - visible_rows
@@ -1906,104 +2121,101 @@ def render_frame(canvas: Canvas, state: AppState, tick: int) -> None:
     # ── Status bar ─────────────────────────────────────────────────────────
     if busy:
         spin = _SPINNER[(tick // 4) % len(_SPINNER)]
-        label = think_label[0].upper() + think_label[1:] if think_label else "Thinking…"
+        label = (
+            (think_label[0].upper() + think_label[1:]) if think_label else "Thinking…"
+        )
         elapsed = f"({time.time() - think_start:.0f}s)" if think_start else ""
-        # Left part: spinner + shimmered label
         left = f"{Theme.SPIN}{spin}%reset " + _shimmer_line(label, tick)
-        # Right part: elapsed right-aligned with 1-char gap from border
         if elapsed:
-            elapsed_plain = f" {elapsed} "
-            elapsed_x = W - len(elapsed_plain) - 2
-            canvas.text(elapsed_x, STATUS_ROW, f"%color(90,90,90){elapsed_plain}")
+            ep_x = W - len(f" {elapsed} ") - 2
+            canvas.text(ep_x, STATUS_ROW, f"%color(90,90,90) {elapsed} ")
         canvas.text(1, STATUS_ROW, left)
     elif scroll > 0:
-        indicator = "↑↓ scroll   ␣ type"
-        ind_x = max(0, (W - len(indicator)) // 2)
-        canvas.text(ind_x, STATUS_ROW, Theme.HINT_SCROLL + indicator)
-    else:
         hint = "↑↓ scroll   ␣ type"
-        hint_x = max(0, (W - len(hint)) // 2)
-        canvas.text(hint_x, STATUS_ROW, Theme.HINT + hint)
+        canvas.text(max(0, (W - len(hint)) // 2), STATUS_ROW, Theme.HINT_SCROLL + hint)
+    else:
+        hint = "↑↓ scroll   ␣ type   o thinking"
+        canvas.text(max(0, (W - len(hint)) // 2), STATUS_ROW, Theme.HINT + hint)
 
-    # ── Think block rendering ──────────────────────────────────────────────
-    if _has_think_block and think_lines_expanded:
-
-        def _render_think_line(kind: str, text: str) -> str:
-            if kind == "pending":
-                return f"{Theme.THINK_PENDING}◎%reset {Theme.THINK_PENDING_T}" + text
-            if kind == "error":
-                return (
-                    f"{Theme.THINK_ERROR}✘%reset {Theme.THINK_ERROR}" + text + "%reset"
-                )
-            if kind == "done":
-                import re as _re
-
-                m = _re.search(r"(  [+\-\d L]+)$", text)
-                if m:
-                    label = text[: m.start()]
-                    stat = m.group(1)
-                    coloured_stat = ""
-                    for tok in stat.split():
-                        if tok.startswith("+"):
-                            coloured_stat += f" {Theme.DIFF_ADD}{tok}%reset"
-                        elif tok.startswith("-"):
-                            coloured_stat += f" {Theme.DIFF_DEL}{tok}%reset"
-                        else:
-                            coloured_stat += f" {Theme.DIFF_NEUTRAL}{tok}%reset"
-                    return (
-                        f"{Theme.THINK_DONE}✔%reset {Theme.THINK_DONE_T}"
-                        + label
-                        + coloured_stat
-                    )
-                return f"{Theme.THINK_DONE}✔%reset {Theme.THINK_DONE_T}" + text
-            return Theme.THINK_TEXT + text
-
-        if show_thinking:
-            display_rows = think_rows_reserved - 1
-            # Apply think_scroll offset
-            total_think = len(think_lines_expanded)
-            max_think_scroll = max(0, total_think - display_rows)
-            t_scroll = min(think_scroll, max_think_scroll)
-            end_idx = total_think - t_scroll
-            start_idx = max(0, end_idx - display_rows)
-            content = think_lines_expanded[start_idx:end_idx]
-            while content and content[0] == ("text", ""):
-                content = content[1:]
-            block_start = STATUS_ROW - think_rows_reserved
-
-            canvas.text(1, block_start, Theme.THINK_GUTTER + "╭─ " + Theme.THINK_HEADER + "o · collapse thinking")
-            for i, (kind, text) in enumerate(content):
+    # ── Think block ────────────────────────────────────────────────────────
+    if _has_think:
+        block_start = STATUS_ROW - think_rows_reserved
+        if think_mode == 0:
+            # Hidden: just the header tooltip, no content rows
+            canvas.text(
+                1,
+                block_start,
+                Theme.THINK_GUTTER + "╭─ " + Theme.THINK_HEADER + "o · show thinking",
+            )
+        elif think_mode == 1:
+            # Collapsed: header + last 3 lines of thought
+            canvas.text(
+                1,
+                block_start,
+                Theme.THINK_GUTTER + "╭─ " + Theme.THINK_HEADER + "o · expand thinking",
+            )
+            content_rows = think_rows_reserved - 1
+            pool = think_display_lines[-content_rows:] if content_rows else []
+            for i, (kind, text) in enumerate(pool):
                 canvas.text(
                     1,
                     block_start + 1 + i,
-                    Theme.THINK_GUTTER + "│%reset " + _render_think_line(kind, text),
+                    Theme.THINK_GUTTER + "│%reset " + _render_think_event(kind, text),
                 )
         else:
-            pool = think_lines_expanded[-think_rows_reserved:]
-            base_row = STATUS_ROW - 1
-            n = len(pool)
+            # Expanded: header + scrollable full content
+            canvas.text(
+                1,
+                block_start,
+                Theme.THINK_GUTTER
+                + "╭─ "
+                + Theme.THINK_HEADER
+                + "o · collapse thinking",
+            )
+            display_rows = think_rows_reserved - 1
+            total_think = len(think_display_lines)
+            max_tscroll = max(0, total_think - display_rows)
+            t_scroll = min(think_scroll, max_tscroll)
+            end_idx = total_think - t_scroll
+            start_idx = max(0, end_idx - display_rows)
+            pool = think_display_lines[start_idx:end_idx]
+            while pool and pool[0] == ("text", ""):
+                pool = pool[1:]
+            # Pad to display_rows so the gutter is always fully drawn.
+            # Without this, rows below the content are blank and the box
+            # appears to jump/shrink when pool is shorter than the reserved space.
+            while len(pool) < display_rows:
+                pool.append(("text", ""))
             for i, (kind, text) in enumerate(pool):
-                row = base_row - (n - 1 - i)
                 canvas.text(
                     1,
-                    row,
-                    Theme.THINK_GUTTER + "│%reset " + _render_think_line(kind, text),
+                    block_start + 1 + i,
+                    Theme.THINK_GUTTER + "│%reset " + _render_think_event(kind, text),
                 )
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# Filesystem / prompt helpers
+# § 9  Filesystem helpers + system prompt
 # ═══════════════════════════════════════════════════════════════════════════════
 
 
 def _load_ignore_patterns(root: Path) -> List[str]:
-    patterns = [".git", "__pycache__", "*.pyc", ".DS_Store", ".vscode"]
-    ignore_file = root / ".gitignore"
-    if ignore_file.exists():
-        for line in ignore_file.read_text().splitlines():
-            line = line.strip()
-            if line and not line.startswith("#"):
-                patterns.append(line)
+    patterns = [
+        ".git",
+        "__pycache__",
+        "*.pyc",
+        ".DS_Store",
+        ".vscode",
+        "node_modules",
+        "*.egg-info",
+    ]
+    for f in (".gitignore", ".ignore"):
+        ignore_file = root / f
+        if ignore_file.exists():
+            for line in ignore_file.read_text().splitlines():
+                line = line.strip()
+                if line and not line.startswith("#"):
+                    patterns.append(line)
     return patterns
 
 
@@ -2038,17 +2250,19 @@ def _generate_tree(
     return built
 
 
-def generate_system_prompt(cwd: str) -> str:
+def generate_system_prompt(cwd: str, task: str = "") -> str:
     path = Path(cwd).resolve()
     patterns = _load_ignore_patterns(path)
     tree = _generate_tree(path, path, patterns)
 
-    return f"""You are a senior software engineer. You are working inside a real developer project on the user's computer. You have tools to read, write, create, and delete files, search the web, and consult a critic. USE THESE TOOLS. Do not guess what files contain — read them first.
+    task_block = task.strip() if task.strip() else "(not yet set — await the user's first message)"
+    return f"""\
+You are a senior software engineer working inside a real project on the user's machine.
+You have direct access to the filesystem and shell. USE YOUR TOOLS — do not guess, read.
 
 ════════════════════════════════════════
 PROJECT
 ════════════════════════════════════════
-
 Working directory: {path}
 
 File tree:
@@ -2057,101 +2271,96 @@ File tree:
 ```
 
 ════════════════════════════════════════
-YOUR ROLE
+CURRENT TASK
 ════════════════════════════════════════
-
-You are a local coding agent. You work like Claude Code or Codex:
-- ALL real work happens inside your thinking.
-- Your visible reply is ONLY a short summary of what you did.
-- The user watches your thinking live. They do not need you to explain your work in the reply — they already saw it happen.
+{task_block}
 
 ════════════════════════════════════════
 YOUR TOOLS
 ════════════════════════════════════════
-
-Call tools freely inside your thinking. No permission needed.
-
-read_file(path)       — Read a file. Paths are relative to the working directory.
-write_file(path, content) — Overwrite a file. MUST provide the full file content.
-create_file(path, content) — Create a new file.
-delete_file(path)     — Delete a file (user confirms).
-web_search(query)     — Search the web for docs, APIs, error messages, facts.
-consult_critic(plan)  — Get adversarial review of your plan or code before committing.
-
-════════════════════════════════════════
-HOW TO WORK
-════════════════════════════════════════
-
-Inside your thinking, do the following in order:
-
-1. Understand the task. One sentence.
-2. Read every relevant file with read_file before touching anything.
-3. If you need external information, call web_search.
-4. Form a plan. Then immediately execute it — do not describe it, do it.
-5. For any non-trivial implementation, call consult_critic before writing the final version.
-6. Call write_file or create_file with the complete, correct content.
-7. Verify your work. If something is wrong, fix it now — do not leave it for the user.
-
-HARD RULES:
-- NEVER read the same file twice.
-- NEVER write partial file content. Every write_file must contain the entire file.
-- NEVER invent what a file contains. Read it first.
-- If you catch yourself writing "I should..." or "I will..." — stop and do it instead.
-- Do not plan. Do not draft. Execute.
+read_file(path, [start_line], [end_line])
+                              — Read up to 300 lines of a file (1-based range).
+                                If truncated, a notice tells you how to read the next chunk.
+search_file(path, pattern, [context_lines])
+                              — Grep-style search inside a file. Returns matching lines
+                                with line numbers and context. Use BEFORE read_file on
+                                large files to find the region you need.
+write_file(path, content)     — Overwrite a file. MUST contain the COMPLETE file content.
+create_file(path, content)    — Create a new file (fails if it already exists).
+delete_file(path)             — Delete a file (requires user confirmation).
+run_command(command)          — Run a shell command (requires user confirmation).
+                                Use for: tests, linting, builds, installs, git, etc.
+web_search(query)             — Search the web for docs, APIs, error messages, or facts.
+consult_critic(plan)          — Adversarial review of your plan or code before committing.
 
 ════════════════════════════════════════
-YOUR REPLY (after thinking is done)
+HOW TO WORK (inside your thinking)
 ════════════════════════════════════════
+1. Understand the task in one sentence.
+2. For large files: use search_file to locate the relevant region, then read_file
+   with start_line/end_line. Only read the sections you actually need.
+   For extraction tasks (imports, function names, class definitions, etc.) search_file
+   with a targeted pattern is faster and uses far less context than reading the whole file.
+   For small files: read_file with no range is fine.
+3. For external information (APIs, error codes, versions), call web_search.
+4. Form a concrete plan. Then execute it immediately — do not describe it.
+5. For non-trivial code, call consult_critic before the final write.
+6. Write complete files with write_file / create_file.
+7. Verify: run tests with run_command if a test suite exists.
+8. If something is wrong, fix it before replying.
 
-After your thinking is complete and all files have been written, give the user a SHORT plain-text reply.
+HARD RULES — violations waste time and produce wrong answers:
+— NEVER read the same file twice. You already have its contents.
+— NEVER write partial file content. Every write_file must contain the entire file.
+— NEVER invent what a file contains. Read it first.
+— NEVER re-examine a decision you have already made. Move forward.
+— If you find yourself writing "I should..." or "I will..." — stop and do it instead.
+— NEVER list, enumerate, or guess values from memory (imports, functions, symbols,
+  dependencies, etc.). If you need to know what is in a file, READ IT. Any list you
+  produce from memory will be wrong or incomplete. Use search_file or read_file and
+  work from the actual content, not from what you expect the file to contain.
 
-YOUR REPLY MUST FOLLOW THESE RULES — NO EXCEPTIONS:
-- NO code. Not a single line. Not a snippet. Not a block. Nothing inside backticks.
-- NO markdown formatting of any kind.
-- NO explanations of how you implemented something.
-- NO walkthroughs, NO "here is what I did", NO "I have implemented...".
-- MAXIMUM 4 lines of text total.
+THINKING DISCIPLINE — this is critical:
+— Think through each step ONCE. Do not loop back and re-check conclusions.
+— After a tool call succeeds, read the result and continue to the NEXT step.
+  Do not re-analyse what the tool just did — the result is the confirmation.
+— Do not re-read files you already read. The content is in your context.
+— Do not re-derive code you already wrote. The write receipt confirms it was saved.
+— If you catch yourself re-examining something already resolved, STOP and move on.
 
-The ONLY things allowed in your reply:
-1. One sentence saying what was done.
-2. A list of files changed, one per line: "filename — what changed"
-3. One line if the user needs to do something (e.g. install a dependency).
+════════════════════════════════════════
+YOUR REPLY  (after all work is done)
+════════════════════════════════════════
+Write a SHORT plain-text summary. NO code, NO markdown, MAXIMUM 4 lines.
 
-If the user wants to see the code, they will open the file. Do not show it to them.
+Allowed:
+  1. One sentence describing what was done.
+  2. Files changed, one per line: "filename — what changed"
+  3. One line for any required user action (e.g. "Run: pip install httpx").
 
-GOOD reply:
-  Implemented the AST calculator with full operator precedence and error handling.
-  calculator.py — created
-  main.py — updated import
-
-BAD reply (NEVER do this):
-  Here is the implementation:
-  ```python
-  class Parser:
-      ...
-  ```
+If the user wants to see the code they will open the file.
 """
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# Notification helper
+# § 10  Notification helper
 # ═══════════════════════════════════════════════════════════════════════════════
 
 
-def _summarize_and_notify(title: str, messages: List[dict]) -> None:
-    """Generate a one-sentence summary of the conversation, then notify."""
+def _notify_async(title: str, messages: List[dict]) -> None:
+    """Generate a one-sentence summary and send a desktop notification."""
 
     def _run() -> None:
         try:
             resp = ollama.chat(
-                _MODEL,
+                _SMALL_MODEL,
                 messages=[
                     {
                         "role": "system",
                         "content": (
-                            "Summarize the assistant's last reply in one short sentence "
-                            "(under 80 chars). Reply with ONLY the summary — no preamble, "
-                            "no thinking, no punctuation at the end."
+                            "Summarise the assistant's last reply in one short sentence "
+                            "(under 80 chars). Reply with ONLY the summary — "
+                            "no preamble, no thinking, no punctuation at the end."
                         ),
                     },
                     *messages[-6:],
@@ -2159,20 +2368,22 @@ def _summarize_and_notify(title: str, messages: List[dict]) -> None:
                 stream=False,
                 options={"num_predict": 60, "temperature": 0},
             )
-            summary = resp.message.content or ""
+            summary = (resp.message.content or "").strip()
             summary = re.sub(
                 r"<think>.*?</think>", "", summary, flags=re.DOTALL
             ).strip()
             summary = summary[:80]
         except Exception:
             summary = "Response received."
-        notification.notify(title=title, message=summary, timeout=5)  # type: ignore
+        notify_fn = getattr(notification, "notify", None)
+        if callable(notify_fn):
+            notify_fn(title=title, message=summary, timeout=5)
 
     threading.Thread(target=_run, daemon=True).start()
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# Entry point
+# § 11  main()
 # ═══════════════════════════════════════════════════════════════════════════════
 
 
@@ -2181,16 +2392,15 @@ def main(argv: Tuple[str, ...]) -> None:
         print("Usage: python main.py <directory_path>")
         return
 
-    # Ensure the Ollama daemon is running before anything else
+    # Ensure the Ollama daemon is up
     try:
-        ollama.list()  # cheap ping — succeeds if daemon is already up
+        ollama.list()
     except Exception:
         subprocess.Popen(
             ["ollama", "serve"],
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
         )
-        # Give it a moment to bind its socket
         for _ in range(20):
             time.sleep(0.5)
             try:
@@ -2199,7 +2409,7 @@ def main(argv: Tuple[str, ...]) -> None:
             except Exception:
                 pass
 
-    # Keep the system awake for the lifetime of this process
+    # Keep display awake on macOS
     if platform.system() == "Darwin":
         subprocess.Popen(
             ["caffeinate", "-i", "-w", str(os.getpid())],
@@ -2207,83 +2417,84 @@ def main(argv: Tuple[str, ...]) -> None:
             stderr=subprocess.DEVNULL,
         )
 
-    target_path = argv[1]
+    root = Path(argv[1]).resolve()
     state = AppState()
-    root = Path(target_path).resolve()
 
     tw = os.get_terminal_size().columns
     th = os.get_terminal_size().lines
     canvas = Canvas(tw, th - 8)
-    worker = OllamaWorker(state, canvas, root)
+    worker = AgentWorker(state, canvas, root)
 
     tick = 0
     _SCROLL_STEP = 3
     _fd = sys.stdin.fileno()
-
-    # Save original terminal settings so we can restore them and use them
-    # for read_line (which needs normal cooked/echo mode).
-    _cooked = termios.tcgetattr(_fd)
+    _cooked = termios.tcgetattr(_fd)  # saved for read_line restore
 
     def _key_available() -> bool:
-        """Return True if a keypress is waiting on stdin (non-blocking)."""
         return bool(select.select([_fd], [], [], 0)[0])
 
     def _read_key() -> str:
-        """Read one key or escape sequence from stdin (assumes cbreak mode)."""
         ch = os.read(_fd, 1)
-        if ch == b"\x1b":
-            # Escape sequence: read remainder with a short deadline
-            if select.select([_fd], [], [], 0.05)[0]:
-                ch += os.read(_fd, 8)
+        if ch == b"\x1b" and select.select([_fd], [], [], 0.05)[0]:
+            ch += os.read(_fd, 8)
         return ch.decode("utf-8", errors="replace")
 
     def _enter_cbreak() -> None:
-        """Switch stdin to cbreak (no echo, characters available immediately)."""
         tty.setcbreak(_fd, termios.TCSANOW)
 
     def _leave_cbreak() -> None:
-        """Restore stdin to cooked mode with echo for read_line."""
         termios.tcsetattr(_fd, termios.TCSANOW, _cooked)
 
     _enter_cbreak()
 
     try:
         while state.running:
-            # ── Handle terminal resize ─────────────────────────────────────
+            # ── Resize ────────────────────────────────────────────────────
             size = os.get_terminal_size()
             if size.columns != tw or size.lines != th:
                 tw, th = size.columns, size.lines
                 canvas.resize(tw, th - 8)
 
-            # ── Render frame ───────────────────────────────────────────────
+            # ── Render ────────────────────────────────────────────────────
             render_frame(canvas, state, tick)
             canvas.draw()
             tick += 1
 
-            # ── Drain all pending keypresses from stdin ────────────────────
+            # ── Confirm request from worker thread ────────────────────────
+            with state.lock:
+                _creq = state.confirm_request
+            if _creq is not None and _creq.result is None:
+                _leave_cbreak()
+                _answer = (canvas.read_line(_creq.prompt) or "").strip().lower()
+                _enter_cbreak()
+                _creq.result = _answer in ("y", "yes")
+                with state.lock:
+                    state.confirm_request = None
+                _creq.event.set()
+
+            # ── Input ─────────────────────────────────────────────────────
             while _key_available():
                 key = _read_key()
 
-                # ESC — context-sensitive
+                # ESC — abort generation or quit
                 if key == "\x1b":
                     if state.model_busy:
                         with state.lock:
                             state.stop_requested = True
                     else:
                         state.running = False
-                        break
-                    continue
+                    break
 
-                # o — toggle thinking view (works even while busy)
+                # o — toggle think box
                 if key == "o":
                     with state.lock:
-                        state.show_thinking = not state.show_thinking
+                        state.think_mode = (state.think_mode + 1) % 3
                         state.think_scroll = 0
                     continue
 
+                # Scroll keys while model is busy: only inside expanded think box
                 if state.model_busy:
-                    # Only let scroll keys through when the think box is open
-                    if key in ("\x1b[A", "\x1b[B") and state.show_thinking:
+                    if key in ("\x1b[A", "\x1b[B") and state.think_mode == 2:
                         with state.lock:
                             if key == "\x1b[A":
                                 state.think_scroll += _SCROLL_STEP
@@ -2291,17 +2502,18 @@ def main(argv: Tuple[str, ...]) -> None:
                                 state.think_scroll = max(
                                     0, state.think_scroll - _SCROLL_STEP
                                 )
-                    continue  # swallow everything else while model is running
+                    continue  # swallow everything else while busy
 
-                if key == "\x1b[A":  # ↑
+                # Arrow keys — chat / think scroll
+                if key == "\x1b[A":
                     with state.lock:
-                        if state.show_thinking:
+                        if state.think_mode == 2:
                             state.think_scroll += _SCROLL_STEP
                         else:
                             state.scroll_offset += _SCROLL_STEP
-                elif key == "\x1b[B":  # ↓
+                elif key == "\x1b[B":
                     with state.lock:
-                        if state.show_thinking:
+                        if state.think_mode == 2:
                             state.think_scroll = max(
                                 0, state.think_scroll - _SCROLL_STEP
                             )
@@ -2309,8 +2521,9 @@ def main(argv: Tuple[str, ...]) -> None:
                             state.scroll_offset = max(
                                 0, state.scroll_offset - _SCROLL_STEP
                             )
-                elif key == " ":  # space → enter prompt mode
-                    # ── Read user prompt ───────────────────────────────────
+
+                # Space — enter prompt mode
+                elif key == " ":
                     _leave_cbreak()
                     raw_input = canvas.read_line("> ") or ""
                     _enter_cbreak()
@@ -2318,14 +2531,12 @@ def main(argv: Tuple[str, ...]) -> None:
                     with state.lock:
                         state.scroll_offset = 0
 
-                    # ESC in cooked mode arrives as a literal \x1b in the string
                     if "\x1b" in raw_input:
-                        continue  # cancelled — exit prompt mode silently
+                        continue  # cancelled
 
                     user_input = raw_input.strip()
-
                     if not user_input:
-                        continue  # exit prompt mode, don't quit
+                        continue
 
                     if user_input.lower() in ("bye", "quit", "exit"):
                         state.running = False
@@ -2336,9 +2547,10 @@ def main(argv: Tuple[str, ...]) -> None:
                         messages_snapshot = list(state.messages)
                         state.model_busy = True
                         state.current_output = ""
+                        state.think_duration = 0.0
 
-                    system_prompt = generate_system_prompt(str(root))
-                    worker.start(messages_snapshot, system_prompt)
+                    system_prompt = generate_system_prompt(str(root), user_input)
+                    worker.start(messages_snapshot, system_prompt, user_input)
                     _start_think_labeller(state)
 
             time.sleep(0.016)
