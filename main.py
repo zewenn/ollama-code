@@ -59,9 +59,8 @@ class Theme:
     ASST_THOUGHT = "%color(80,80,80)"
     ASST_HEADER = "%color(70,70,70)"
 
-    # ── Think block ───────────────────────────────────────────────────────────
-    THINK_GUTTER = "%color(80,80,80)"
     THINK_TEXT = "%color(100,100,100)"
+    THINK_GUTTER = "%color(80,80,80)"
     THINK_HEADER = "%color(55,55,75)"
     THINK_PENDING = "%color(160,140,60)"
     THINK_PENDING_T = "%color(150,140,100)"
@@ -504,6 +503,14 @@ class ConfirmRequest:
 
 
 @dataclass
+class TodoItem:
+    """One step in the plan. Completed strictly in order."""
+
+    text: str
+    done: bool = False
+
+
+@dataclass
 class AppState:
     # ── Conversation history ─────────────────────────────────────────────────
     messages: List[dict] = field(default_factory=list)
@@ -535,6 +542,16 @@ class AppState:
 
     # ── Confirm request (worker → main thread) ──────────────────────────────
     confirm_request: Optional["ConfirmRequest"] = None
+
+    # ── Plan mode ────────────────────────────────────────────────────────────
+    todo_items: List["TodoItem"] = field(default_factory=list)
+    plan_mode: bool = False
+    plan_hint: bool = False
+    plan_enabled: bool = False  # persistent toggle: tab key
+    show_plan_view: bool = False  # i key: overlay showing full plan
+    task_work_done: bool = (
+        False  # set True when a mutating tool runs; reset on complete_task
+    )
 
     # ── Completed-turn summary (shown in chat after busy = False) ────────────
     last_turn_tools: List[ToolEvent] = field(default_factory=list)
@@ -673,6 +690,27 @@ _TOOLS: List[dict] = [
     {
         "type": "function",
         "function": {
+            "name": "summarise_file",
+            "description": (
+                "Read an entire file and return a short but detailed summary. "
+                "Use instead of read_file when you only need to understand the contents, "
+                "not quote or edit them. Much cheaper on context than reading the raw file."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": {
+                        "type": "string",
+                        "description": "Relative path from project root.",
+                    },
+                },
+                "required": ["path"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "run_command",
             "description": (
                 "Run a shell command in the project directory and return its output. "
@@ -729,6 +767,22 @@ _TOOLS: List[dict] = [
             },
         },
     },
+]
+
+# Restricted tool list for plan-mode single-task execution.
+# No critic, no web search, no delete, no complete_task — just file ops.
+_PLAN_TOOLS: List[dict] = [
+    t
+    for t in _TOOLS
+    if t["function"]["name"]
+    in (
+        "read_file",
+        "search_file",
+        "summarise_file",
+        "write_file",
+        "create_file",
+        "run_command",
+    )
 ]
 
 
@@ -795,13 +849,14 @@ def _tool_read_file(
 
     chunk = all_lines[start - 1 : end]
     header = f"[FILE READ: {rel}  lines {start}-{end} of {total}  — this is a tool result, not user input]\n"
-    body   = "\n".join(f"{start + i:>6}  {line}" for i, line in enumerate(chunk))
+    body = "\n".join(f"{start + i:>6}  {line}" for i, line in enumerate(chunk))
 
     footer = (
         f"\n[END OF CHUNK — {total - end} more lines remain. "
-        f"To read the next section call read_file(path=\"{rel}\", start_line={end + 1}). "
+        f'To read the next section call read_file(path="{rel}", start_line={end + 1}). '
         f"Your task has not changed — continue working on it.]"
-        if end < total else f"\n[END OF FILE: {rel}]"
+        if end < total
+        else f"\n[END OF FILE: {rel}]"
     )
     return header + body + footer
 
@@ -845,6 +900,50 @@ def _tool_search_file(
     total_matches = len(hits)
     header = f"[{rel} - {total_matches} match{'es' if total_matches != 1 else ''} for {pattern!r}]\n"
     return header + "\n---\n".join(blocks)
+
+
+def _tool_summarise_file(path: Path, rel: str) -> str:
+    """Read the full file and ask qwen3 for a concise but detailed summary.
+    The summary is capped so it never blows the context window."""
+    if not path.exists():
+        return f"[ERROR] File not found: {rel}"
+    try:
+        content = path.read_text(encoding="utf-8")
+    except Exception as e:
+        return f"[ERROR] Cannot read {rel}: {e}"
+
+    total_lines = content.count("\n") + 1
+    # Truncate input to ~120 KB of text to avoid OOM on huge files
+    MAX_CHARS = 120_000
+    truncated = ""
+    if len(content) > MAX_CHARS:
+        content = content[:MAX_CHARS]
+        truncated = (
+            f" (first {MAX_CHARS // 1000} KB shown; file has {total_lines} lines)"
+        )
+
+    prompt = (
+        f"File: {rel}{truncated}\n"
+        "Summarise the file contents below. Be concise but include:\n"
+        "- What the file does / its purpose\n"
+        "- Key functions, classes, or data structures\n"
+        "- Important constants, config values, or dependencies\n"
+        "- Any non-obvious behaviour worth noting\n"
+        "Keep the summary under 200 words.\n\n"
+        f"```\n{content}\n```"
+    )
+    try:
+        resp = ollama.chat(
+            model=_MODEL,
+            messages=[{"role": "user", "content": prompt}],
+            stream=False,
+            options={"temperature": 0},
+        )
+        summary = (resp.message.content or "").strip()
+        summary = re.sub(r"<think>.*?</think>", "", summary, flags=re.DOTALL).strip()
+        return f"[SUMMARY: {rel} ({total_lines} lines)\n{summary}]"
+    except Exception as e:
+        return f"[ERROR] summarise_file failed: {e}"
 
 
 def _file_diff(rel: str, before: str, after: str) -> str:
@@ -1005,6 +1104,37 @@ def _tool_web_search(query: str) -> str:
     )
 
 
+def _tool_complete_task(state: "AppState", index: int) -> str:
+    """Mark task *index* (1-based) done, enforcing sequential order."""
+    with state.lock:
+        items = state.todo_items
+        if not items:
+            return "[ERROR] No active plan."
+        next_idx = next((i for i, t in enumerate(items) if not t.done), None)
+        if next_idx is None:
+            return "All tasks are already complete."
+        expected = next_idx + 1
+        if index != expected:
+            return (
+                f"[ERROR] Must complete tasks in order. "
+                f'Next task is #{expected}: "{items[next_idx].text}". '
+                f"Finish that one first."
+            )
+        if not state.task_work_done:
+            return (
+                f"[ERROR] You have not performed any file or command operations for task "
+                f"#{expected}. You must write_file, create_file, or run_command before "
+                f"calling complete_task. Do the actual work first."
+            )
+        items[next_idx].done = True
+        state.task_work_done = False  # reset for next task
+        remaining = sum(1 for t in items if not t.done)
+        return (
+            f'Task #{expected} complete: "{items[next_idx].text}". '
+            f"{remaining} task{'s' if remaining != 1 else ''} remaining."
+        )
+
+
 def _tool_consult_critic(plan: str) -> str:
     """Run *plan* through an adversarial critic instance and return its verdict."""
     _CRITIC_SYSTEM = (
@@ -1142,15 +1272,23 @@ class AgentWorker:
     }
 
     def __init__(self, state: AppState, canvas: Canvas, root: Path) -> None:
-        self._state  = state
+        self._state = state
         self._canvas = canvas
-        self._root   = root
-        self._task   = ""  # current user request, echoed into every tool result
+        self._root = root
+        self._task = ""
+        self._plan_mode = False
 
     # ── Public API ────────────────────────────────────────────────────────────
 
-    def start(self, messages: List[dict], system_prompt: str, task: str = "") -> None:
+    def start(
+        self,
+        messages: List[dict],
+        system_prompt: str,
+        task: str = "",
+        plan_mode: bool = False,
+    ) -> None:
         self._task = task.strip()
+        self._plan_mode = plan_mode
         threading.Thread(
             target=self._run,
             args=(list(messages), system_prompt),
@@ -1165,101 +1303,163 @@ class AgentWorker:
             self._state.think_output = ""
             self._state.current_output = ""
             self._state.reply_started = False
+            self._state.todo_items = []
+            self._state.plan_mode = self._plan_mode
+            self._state.plan_hint = False
+            self._state.task_work_done = False
 
-        # history is the single source of truth — no side-channel injections.
-        # The system prompt is prepended on every call; conversation messages live here.
+        if self._plan_mode and self._task:
+            self._run_planner()
+            with self._state.lock:
+                has_plan = bool(self._state.todo_items)
+            if has_plan:
+                self._run_plan_mode(messages, system_prompt)
+                return
+
+        # ── Normal (non-plan) mode ────────────────────────────────────────────
         history: List[dict] = list(messages)
-        think_acc: str = (
-            ""  # all thinking text accumulated across tool turns (display only)
-        )
-        output_acc: str = ""  # final visible reply
+        think_acc = ""
+        output_acc = ""
+        try:
+            while True:
+                if self._stopped():
+                    break
+                content, think_chunk, tool_calls, asst_msg = self._stream_one_turn(
+                    history, system_prompt, think_acc
+                )
+                think_acc += think_chunk
+                output_acc = content
+                history.append(asst_msg)
+                if not tool_calls:
+                    break
+                with self._state.lock:
+                    self._state.reply_started = False
+                    self._state.current_output = ""
+                think_acc = self._execute_tool_calls(tool_calls, history, think_acc)
+        except Exception as exc:
+            output_acc = f"[ERROR] {exc}"
+            with self._state.lock:
+                self._state.current_output = output_acc
+        finally:
+            self._finalize(output_acc)
+
+    def _run_plan_mode(self, messages: List[dict], system_prompt: str) -> None:
+        """Execute the task list one item at a time.
+
+        For each task:
+          1. Record where history ends before the task starts.
+          2. Run the agent until it finishes (any_work_done + no more tool calls).
+          3. Compress the raw tool messages from that task into a single summary
+             entry in history (context compression — prevents window bloat).
+          4. Tick the task and advance.
+
+        When the plan finishes, history is the authoritative record and is
+        written back to state.messages so the next user turn has full context.
+        """
+        history: List[dict] = list(messages)
+        completed_summaries: List[str] = []  # passed to each task for context
+        output_acc = ""
 
         try:
             while True:
                 if self._stopped():
                     break
 
-                # Stream one model turn.  Returns the assembled assistant message
-                # dict that must be appended to history before executing tools.
-                content, think_chunk, tool_calls, asst_msg = self._stream_one_turn(
-                    history, system_prompt, think_acc
-                )
-                think_acc += think_chunk
-                output_acc = content
-
-                # Step 4: append the assistant message BEFORE touching tools.
-                # This is the correct Ollama pattern — the Message object (or an
-                # equivalent dict with role/content/thinking/tool_calls) goes into
-                # history so the next API call sees the full context.
-                history.append(asst_msg)
-
-                if not tool_calls:
-                    break  # final reply already being streamed
-
-                # Tool calls are coming — reset reply_started so the renderer
-                # doesn't treat preamble text as the final reply.
                 with self._state.lock:
-                    self._state.reply_started = False
+                    todo = list(self._state.todo_items)
+                pending = [t for t in todo if not t.done]
+
+                if not pending:
+                    break
+
+                task = pending[0]
+
+                # upcoming tasks the model must NOT start yet
+                upcoming = [t.text for t in todo if not t.done and t is not task]
+
+                # Clear per-task UI state
+                with self._state.lock:
+                    self._state.think_output = ""
                     self._state.current_output = ""
+                    self._state.reply_started = False
+                    self._state.task_work_done = False
+                    self._state.tool_events = []
 
-                # Steps 5–6: execute tools and append results
-                for tc in tool_calls:
-                    fn = tc.function.name
-                    args = tc.function.arguments  # already a dict from the Ollama lib
-                    if isinstance(args, str):
-                        try:
-                            args = json.loads(args)
-                        except:
-                            args = {}
+                # Snapshot history length so we can compress after
+                history_len_before = len(history)
 
-                    # Snapshot line count BEFORE mutation for accurate diff stat
-                    before_lines = self._snapshot_lines(fn, args)
+                task_done = self._run_one_task(
+                    task.text,
+                    history,
+                    system_prompt,
+                    completed_summaries=completed_summaries,
+                    upcoming_tasks=upcoming,
+                )
 
-                    # Register PENDING event in state and think display
-                    event = self._push_tool_event(fn, args)
-                    pending_sentinel = f"\x00TOOL_PENDING\x00{event.label}…"
-                    think_acc += f"\n{pending_sentinel}"
+                if self._stopped():
+                    break
+
+                if not task_done:
+                    err = f'[plan] Could not complete: "{task.text}". Stopping.'
                     with self._state.lock:
-                        self._state.think_output = think_acc
+                        self._state.messages.append(
+                            {"role": "assistant", "content": err}
+                        )
+                    break
 
-                    # Execute (may block on _confirm for delete/run_command)
-                    result = self._execute_tool(fn, args)
+                # Snapshot tool events for the UI before clearing
+                with self._state.lock:
+                    last_tools = list(self._state.tool_events)
+                    self._state.last_turn_tools = last_tools
 
-                    # Compute stat, resolve event, update display
-                    stat = self._compute_stat(fn, args, before_lines)
-                    self._resolve_tool_event(event, result, stat)
-                    is_error = result.startswith("[ERROR]")
-                    done_sentinel = (
-                        f"\x00TOOL_ERROR\x00{event.label}"
-                        if is_error
-                        else f"\x00TOOL_DONE\x00{event.label}{stat}"
+                # Tick the task
+                with self._state.lock:
+                    if not task.done:
+                        task.done = True
+                    self._state.task_work_done = False
+                    self._state.tool_events = []
+
+                # Build summary sentence
+                summary = self._summarize_task(task.text, history)
+
+                # ── Context compression ──────────────────────────────────────
+                # Replace everything _run_one_task added to history with a richer
+                # but compact entry: summary + list of files touched.
+                # This prevents raw file dumps from accumulating across tasks
+                # while giving the model enough context to avoid re-doing work.
+                mutating = {"write_file", "create_file", "run_command", "delete_file"}
+                files_done = [
+                    ev.label
+                    for ev in last_tools
+                    if ev.status == ToolStatus.DONE and ev.name in mutating
+                ]
+                if files_done:
+                    compressed_content = (
+                        f"{summary}\nFiles changed: {', '.join(files_done)}"
                     )
-                    think_acc = (
-                        think_acc.replace(pending_sentinel, done_sentinel) + "\n"
-                    )
-                    with self._state.lock:
-                        self._state.think_output = think_acc
+                else:
+                    compressed_content = summary
 
-                    # Append tool result to history.
-                    # Per Ollama docs the correct key is "tool_name", not "name".
-                    # Append the original task as a reminder at the end of every
-                    # tool result — this keeps it in the model's effective attention
-                    # range regardless of how much file content was just returned.
-                    task_reminder = self._task
-                    history.append(
-                        {
-                            "role": "tool",
-                            "tool_name": fn,
-                            "content": (
-                                result
-                                + f"\n\n[REMINDER: your task is: {task_reminder}]"
-                            ),
-                        }
-                    )
+                del history[history_len_before:]  # drop raw tool messages
+                history.append({"role": "assistant", "content": compressed_content})
 
-                # Loop back — the history now contains the full context:
-                # prior turns, the assistant's tool_calls message, and all tool
-                # results.  No continuation prompt injection is needed or correct.
+                # Track for subsequent tasks' context prompts
+                completed_summaries.append(compressed_content)
+
+                # Show the plain summary in chat (same text, no prefix — so
+                # state.messages = history[:] at the end causes no visual change)
+                with self._state.lock:
+                    self._state.messages.append(
+                        {"role": "assistant", "content": compressed_content}
+                    )
+                    self._state.current_output = ""
+                    self._state.reply_started = False
+
+            # Sync: history is the authoritative record for the next user turn
+            with self._state.lock:
+                self._state.messages = history[:]
+
+            output_acc = ""
 
         except Exception as exc:
             output_acc = f"[ERROR] {exc}"
@@ -1269,13 +1469,236 @@ class AgentWorker:
         finally:
             self._finalize(output_acc)
 
+    def _run_one_task(
+        self,
+        task_text: str,
+        history: List[dict],
+        system_prompt: str,
+        completed_summaries: Optional[List[str]] = None,
+        upcoming_tasks: Optional[List[str]] = None,
+    ) -> bool:
+        """Run the agent loop for a single plan task.
+
+        Exits when the model produces a turn with NO tool calls after at least
+        one mutating tool has succeeded — this allows tasks that require multiple
+        writes (e.g. write two files) to complete naturally.
+
+        Returns True if any work was done, False if the safety cap was hit or
+        the agent was stopped before doing anything.
+        """
+        think_acc = ""
+        max_turns = 15
+        any_work_done = False
+
+        for _ in range(max_turns):
+            if self._stopped():
+                return False
+
+            # Build context blocks for the system prompt
+            done_block = ""
+            if completed_summaries:
+                lines = "\n".join(f"  ✓ {s}" for s in completed_summaries)
+                done_block = (
+                    "\n\nALREADY COMPLETED — do not redo or touch these:\n" + lines
+                )
+
+            upcoming_block = ""
+            if upcoming_tasks:
+                lines = "\n".join(f"  → {t}" for t in upcoming_tasks)
+                upcoming_block = (
+                    "\n\nUPCOMING TASKS — do NOT start these yet, even if it seems efficient:\n"
+                    + lines
+                )
+
+            _sys = system_prompt + (
+                "\n\n════════════════════════════════════════\n"
+                "CURRENT TASK (do this and only this)\n"
+                "════════════════════════════════════════\n"
+                f"{task_text}"
+                f"{done_block}"
+                f"{upcoming_block}\n\n"
+                "Use write_file, create_file, run_command, or delete_file to complete\n"
+                "the CURRENT TASK only. When all required tool calls are done, stop\n"
+                "calling tools and write one short sentence confirming what you did."
+            )
+
+            content, think_chunk, tool_calls, asst_msg = self._stream_one_turn(
+                history,
+                _sys,
+                think_acc,
+                temperature=0.3,
+                inject_plan=False,
+                tools=_PLAN_TOOLS,
+            )
+            think_acc += think_chunk
+            history.append(asst_msg)
+
+            if not tool_calls:
+                if any_work_done:
+                    # Work is done, model has confirmed — suppress the confirmation
+                    # text from appearing in the chat (it will vanish when cleared)
+                    with self._state.lock:
+                        self._state.current_output = ""
+                        self._state.reply_started = False
+                    return True
+                # No tools, no prior work — nudge
+                with self._state.lock:
+                    self._state.current_output = ""
+                    self._state.reply_started = False
+                history.append(
+                    {
+                        "role": "user",
+                        "content": (
+                            f'You have not completed the task yet: "{task_text}". '
+                            "Call write_file, create_file, run_command, or delete_file. "
+                            "Do not write text — call a tool."
+                        ),
+                    }
+                )
+                continue
+
+            with self._state.lock:
+                self._state.reply_started = False
+                self._state.current_output = ""
+
+            think_acc = self._execute_tool_calls(tool_calls, history, think_acc)
+
+            with self._state.lock:
+                if self._state.task_work_done:
+                    any_work_done = True
+                    self._state.task_work_done = False
+
+        return any_work_done
+
+    def _execute_tool_calls(
+        self,
+        tool_calls: List[Any],
+        history: List[dict],
+        think_acc: str,
+    ) -> str:
+        """Execute a list of tool calls, update history and think display.
+        Returns the updated think_acc string."""
+        for tc in tool_calls:
+            fn = tc.function.name
+            args = tc.function.arguments
+            if isinstance(args, str):
+                try:
+                    args = json.loads(args)
+                except Exception:
+                    args = {}
+
+            before_lines = self._snapshot_lines(fn, args)
+            event = self._push_tool_event(fn, args)
+            pending_sentinel = f"\x00TOOL_PENDING\x00{event.label}…"
+            think_acc += f"\n{pending_sentinel}"
+            with self._state.lock:
+                self._state.think_output = think_acc
+
+            result = self._execute_tool(fn, args)
+
+            stat = self._compute_stat(fn, args, before_lines)
+            self._resolve_tool_event(event, result, stat)
+            is_error = result.startswith("[ERROR]")
+            done_sentinel = (
+                f"\x00TOOL_ERROR\x00{event.label}"
+                if is_error
+                else f"\x00TOOL_DONE\x00{event.label}{stat}"
+            )
+            think_acc = think_acc.replace(pending_sentinel, done_sentinel) + "\n"
+            with self._state.lock:
+                self._state.think_output = think_acc
+
+            history.append(
+                {
+                    "role": "tool",
+                    "tool_name": fn,
+                    "content": result,
+                }
+            )
+        return think_acc
+
+    def _summarize_task(self, task_text: str, history: List[dict]) -> str:
+        """Ask llama3.2 for a one-line summary of what was done for this task."""
+        # Grab the last few history entries as context (avoid huge payloads)
+        recent = history[-6:]
+        ctx = "\n".join(
+            f"{m['role']}: {str(m.get('content', ''))[:300]}" for m in recent
+        )
+        prompt = (
+            f"Task: {task_text}\n\n"
+            f"Recent actions:\n{ctx}\n\n"
+            "Write ONE short sentence (max 15 words) summarising what was just done. "
+            "No preamble, no quotes, just the sentence."
+        )
+        try:
+            resp = ollama.chat(
+                model=_SMALL_MODEL,
+                messages=[{"role": "user", "content": prompt}],
+                stream=False,
+                options={"temperature": 0},
+            )
+            return (resp.message.content or "").strip().split("\n")[0]
+        except Exception:
+            return f"Completed: {task_text}"
+
     # ── Private: stream one model turn ───────────────────────────────────────
+
+    def _run_planner(self) -> None:
+        """Break self._task into ordered steps via llama3.2, populate state.todo_items."""
+        prompt = (
+            f"You are a task planner for a coding agent.\n"
+            f"Overall task: {self._task}\n\n"
+            "Break this into sequential steps. Each step must:\n"
+            "— Be a SINGLE file operation (one write_file, one create_file, or one run_command).\n"
+            "— Be completable in ONE tool call with no reading required.\n"
+            "— Be specific: name the exact file and what goes in it.\n"
+            "— NOT include reading, searching, or planning sub-steps — those are implicit.\n"
+            "\n"
+            "Good examples:\n"
+            "1. create README.md with project title and one-paragraph description\n"
+            "2. add installation instructions section to README.md\n"
+            "3. write src/utils.py with helper functions X and Y\n"
+            "\n"
+            "Bad examples (too vague or multi-step):\n"
+            "1. set up the project  ← too vague\n"
+            "2. read and update main.py  ← reading is implicit, not a step\n"
+            "3. implement the whole feature  ← not atomic\n"
+            "\n"
+            "Reply ONLY with the numbered list. No preamble, no commentary.\n\nSteps:"
+        )
+        try:
+            resp = ollama.chat(
+                model=_MODEL,
+                messages=[{"role": "user", "content": prompt}],
+                stream=False,
+                options={"temperature": 0.4},
+            )
+            raw = (resp.message.content or "").strip()
+            # Strip any <think>...</think> block qwen3 may emit before the list
+            raw = re.sub(r"<think>.*?</think>", "", raw, flags=re.DOTALL).strip()
+            items: List[TodoItem] = []
+            for line in raw.splitlines():
+                line = line.strip()
+                # Accept: "1. foo", "1) foo", "Step 1. foo", "Step 1: foo", "- foo", "* foo"
+                m = re.match(r"^\s*(?:[Ss]tep\s*)?\d+[.):\-]\s+(.*)|^[-*]\s+(.*)", line)
+                if m:
+                    text = (m.group(1) or m.group(2) or "").strip()
+                    if text:
+                        items.append(TodoItem(text=text))
+            if items:
+                with self._state.lock:
+                    self._state.todo_items = items
+        except Exception:
+            pass
 
     def _stream_one_turn(
         self,
         history: List[dict],
         system_prompt: str,
         think_acc_so_far: str,
+        temperature: Optional[float] = None,
+        inject_plan: bool = True,
+        tools: Optional[List[dict]] = None,
     ) -> Tuple[str, str, List[Any], dict]:
         """
         Stream one ollama.chat call, parsing <think>...</think> tags manually.
@@ -1292,11 +1715,41 @@ class AgentWorker:
         tool_calls_raw: List[Any] = []
         in_think = False
 
+        _sys = system_prompt
+        if inject_plan:
+            with self._state.lock:
+                _todo = list(self._state.todo_items)
+            if _todo:
+                next_idx = next((i for i, t in enumerate(_todo) if not t.done), None)
+                plan_lines = []
+                for i, item in enumerate(_todo, 1):
+                    if item.done:
+                        plan_lines.append(f"[x] {i}. {item.text}")
+                    elif i - 1 == next_idx:
+                        plan_lines.append(
+                            f"[>] {i}. {item.text}  ← YOUR ONLY TASK RIGHT NOW"
+                        )
+                    else:
+                        plan_lines.append(f"[ ] {i}. {item.text}  (locked)")
+                current_task_text = (
+                    _todo[next_idx].text if next_idx is not None else "all done"
+                )
+                _sys += (
+                    "\n\n════════════════════════════════════════\n"
+                    "PLAN — ONE TASK AT A TIME\n"
+                    "════════════════════════════════════════\n"
+                    + "\n".join(plan_lines)
+                    + f"\n\nCURRENT TASK: {current_task_text}\n"
+                    "Do ONLY this task. Do not start locked tasks."
+                )
+        _active_tools = tools if tools is not None else _TOOLS
+        _opts = {"temperature": temperature} if temperature is not None else {}
         stream = ollama.chat(
             model=_MODEL,
-            messages=[{"role": "system", "content": system_prompt}] + history,
-            tools=_TOOLS,
+            messages=[{"role": "system", "content": _sys}] + history,
+            tools=_active_tools,
             stream=True,
+            options=_opts if _opts else None,
         )
 
         for chunk in stream:
@@ -1348,11 +1801,12 @@ class AgentWorker:
                 self._state.think_duration = time.time() - self._state.think_start
                 self._state.think_output = think_acc_so_far + thinking_chunk
 
-        # Deduplicate tool calls — streaming can deliver the same call twice
+        # Deduplicate tool calls — streaming can deliver the same call twice.
+        # Use json.dumps(sort_keys=True) so dict key order never causes false misses.
         seen: set = set()
         unique: List[Any] = []
         for tc in tool_calls_raw:
-            key = (tc.function.name, str(tc.function.arguments))
+            key = (tc.function.name, json.dumps(tc.function.arguments, sort_keys=True))
             if key not in seen:
                 seen.add(key)
                 unique.append(tc)
@@ -1396,7 +1850,7 @@ class AgentWorker:
             if path is None:
                 return "[ERROR] Path is outside the project directory."
             start = int(args["start_line"]) if "start_line" in args else 1
-            end   = int(args["end_line"])   if "end_line"   in args else None
+            end = int(args["end_line"]) if "end_line" in args else None
             return _tool_read_file(path, rel, start, end)
 
         elif name == "search_file":
@@ -1410,6 +1864,13 @@ class AgentWorker:
             ctx = int(args["context_lines"]) if "context_lines" in args else 3
             return _tool_search_file(path, rel, pattern, ctx)
 
+        elif name == "summarise_file":
+            rel = args.get("path", "")
+            path = _resolve(rel)
+            if path is None:
+                return "[ERROR] Path is outside the project directory."
+            return _tool_summarise_file(path, rel)
+
         elif name == "write_file":
             rel = args.get("path", "")
             path = _resolve(rel)
@@ -1417,7 +1878,11 @@ class AgentWorker:
                 return "[ERROR] Path is outside the project directory."
             if not str(path).startswith(str(self._root)):
                 return "[ERROR] write_file is restricted to the project directory."
-            return _tool_write_file(path, rel, args.get("content", ""))
+            result = _tool_write_file(path, rel, args.get("content", ""))
+            if not result.startswith("[ERROR]"):
+                with self._state.lock:
+                    self._state.task_work_done = True
+            return result
 
         elif name == "create_file":
             rel = args.get("path", "")
@@ -1426,7 +1891,11 @@ class AgentWorker:
                 return "[ERROR] Path is outside the project directory."
             if not str(path).startswith(str(self._root)):
                 return "[ERROR] create_file is restricted to the project directory."
-            return _tool_create_file(path, rel, args.get("content", ""))
+            result = _tool_create_file(path, rel, args.get("content", ""))
+            if not result.startswith("[ERROR]"):
+                with self._state.lock:
+                    self._state.task_work_done = True
+            return result
 
         elif name == "delete_file":
             rel = args.get("path", "")
@@ -1437,7 +1906,11 @@ class AgentWorker:
                 return "[ERROR] delete_file is restricted to the project directory."
             if not self._confirm(f"Delete '{rel}'? [y/N]: "):
                 return "CANCELLED: user declined deletion."
-            return _tool_delete_file(path, rel)
+            result = _tool_delete_file(path, rel)
+            if not result.startswith("[ERROR]"):
+                with self._state.lock:
+                    self._state.task_work_done = True
+            return result
 
         elif name == "run_command":
             cmd = args.get("command", "").strip()
@@ -1446,13 +1919,22 @@ class AgentWorker:
             # cwd is always the project root — the AI must not change it
             if not self._confirm(f"Run: {cmd}  [y/N]: "):
                 return "CANCELLED: user declined command."
-            return _tool_run_command(cmd, self._root)
+            result = _tool_run_command(cmd, self._root)
+            with self._state.lock:
+                self._state.task_work_done = True
+            return result
 
         elif name == "web_search":
             query = args.get("query", "").strip()
             if not query:
                 return "[ERROR] No query provided."
             return _tool_web_search(query)
+
+        elif name == "complete_task":
+            idx = args.get("index")
+            if idx is None:
+                return "[ERROR] No index provided."
+            return _tool_complete_task(self._state, int(idx))
 
         elif name == "consult_critic":
             plan = args.get("plan", "").strip()
@@ -2004,7 +2486,6 @@ def render_frame(canvas: Canvas, state: AppState, tick: int) -> None:
     USER_ZONE_X = int(W * 0.4)
     USER_W = W - 3 - USER_ZONE_X
     THINK_ROWS = 3
-    STATUS_ROW = H - 1
 
     with state.lock:
         messages = list(state.messages)
@@ -2019,6 +2500,13 @@ def render_frame(canvas: Canvas, state: AppState, tick: int) -> None:
         think_label = state.think_label
         think_scroll = state.think_scroll
         reply_started = state.reply_started
+        todo_items = list(state.todo_items)
+        plan_hint = state.plan_hint
+        plan_enabled = state.plan_enabled
+        show_plan_view = state.show_plan_view
+
+    PLAN_ROWS = 1 if (todo_items or plan_enabled or plan_hint) else 0
+    STATUS_ROW = H - 1 - PLAN_ROWS
 
     username = getpass.getuser()
 
@@ -2134,8 +2622,66 @@ def render_frame(canvas: Canvas, state: AppState, tick: int) -> None:
         hint = "↑↓ scroll   ␣ type"
         canvas.text(max(0, (W - len(hint)) // 2), STATUS_ROW, Theme.HINT_SCROLL + hint)
     else:
-        hint = "↑↓ scroll   ␣ type   o thinking"
+        hint = "↑↓ scroll   ␣ type   ⇥ plan   i view plan   o thinking"
         canvas.text(max(0, (W - len(hint)) // 2), STATUS_ROW, Theme.HINT + hint)
+
+    # ── Plan strip ─────────────────────────────────────────────────────────
+    plan_row = STATUS_ROW + 1
+    if PLAN_ROWS:
+        if todo_items:
+            done_count = sum(1 for t in todo_items if t.done)
+            total_count = len(todo_items)
+            active = next((t for t in todo_items if not t.done), None)
+            active_text = active.text if active else "all done"
+            plan_str = f"plan {done_count}/{total_count}  {active_text}"
+            if len(plan_str) > W - 4:
+                plan_str = plan_str[: W - 7] + "..."
+            canvas.text(1, plan_row, f"%color(80,80,80) {plan_str} ")
+        elif plan_enabled:
+            canvas.text(1, plan_row, "%color(55,55,80) plan mode on · ⇥ to disable ")
+        elif plan_hint and not busy:
+            canvas.text(
+                1, plan_row, "%color(70,70,90) ⇥ · enable plan mode for this task "
+            )
+
+    # ── Plan view overlay (i key) — anchored top-left ─────────────────────
+    if show_plan_view and todo_items:
+        ov_w = canvas.width  # full canvas width
+        inner_w = ov_w - 5  # text width between "│ " and " │"
+        border = "%color(55,55,80)"
+        done_c = "%color(70,160,100)"
+        todo_c = "%color(160,160,160)"
+        cur_c = "%color(210,180,80)"
+        head_c = "%color(140,140,200)"
+        sep_c = "%color(55,55,80)"
+        next_i = next((i for i, t in enumerate(todo_items) if not t.done), None)
+
+        _ov_row_y = [1]  # mutable so the nested fn can increment it
+
+        def _ov_row(text: str, colour: str = "%reset") -> None:
+            clipped = text[:inner_w] if len(text) > inner_w else text
+            padded = clipped.ljust(inner_w)
+            canvas.text(
+                0,
+                _ov_row_y[0],
+                border + "│ " + colour + padded + "%reset" + border + " │",
+            )
+            _ov_row_y[0] += 1
+
+        canvas.text(0, 0, border + "╭" + "─" * (ov_w - 3) + "╮")
+        _ov_row("PLAN", head_c)
+        _ov_row("─" * inner_w, sep_c)
+        for idx, item in enumerate(todo_items, 1):
+            if item.done:
+                mark, colour = "x", done_c
+            elif idx - 1 == next_i:
+                mark, colour = ">", cur_c
+            else:
+                mark, colour = " ", todo_c
+            _ov_row(f"[{mark}] {idx}. {item.text}", colour)
+        _ov_row("─" * inner_w, sep_c)
+        _ov_row("i · close", "%color(70,70,90)")
+        canvas.text(0, _ov_row_y[0], border + "╰" + "─" * (ov_w - 3) + "╯")
 
     # ── Think block ────────────────────────────────────────────────────────
     if _has_think:
@@ -2255,7 +2801,11 @@ def generate_system_prompt(cwd: str, task: str = "") -> str:
     patterns = _load_ignore_patterns(path)
     tree = _generate_tree(path, path, patterns)
 
-    task_block = task.strip() if task.strip() else "(not yet set — await the user's first message)"
+    task_block = (
+        task.strip()
+        if task.strip()
+        else "(not yet set — await the user's first message)"
+    )
     return f"""\
 You are a senior software engineer working inside a real project on the user's machine.
 You have direct access to the filesystem and shell. USE YOUR TOOLS — do not guess, read.
@@ -2279,8 +2829,16 @@ CURRENT TASK
 YOUR TOOLS
 ════════════════════════════════════════
 read_file(path, [start_line], [end_line])
-                              — Read up to 300 lines of a file (1-based range).
-                                If truncated, a notice tells you how to read the next chunk.
+                              — Read a file. IMPORTANT: returns at most 300 lines.
+                                If the file is longer, the result ends with a notice:
+                                  [END OF CHUNK — N more lines remain. Call read_file
+                                   with start_line=X to read the next section.]
+                                This does NOT mean you have read the whole file.
+                                You MUST call read_file again with the given start_line
+                                until you see [END OF FILE: path].
+summarise_file(path)          — Ask the model to read and summarise an entire file in
+                                one shot. Use when you need to understand a file without
+                                quoting or editing it. Cheaper on context than read_file.
 search_file(path, pattern, [context_lines])
                               — Grep-style search inside a file. Returns matching lines
                                 with line numbers and context. Use BEFORE read_file on
@@ -2297,11 +2855,12 @@ consult_critic(plan)          — Adversarial review of your plan or code before
 HOW TO WORK (inside your thinking)
 ════════════════════════════════════════
 1. Understand the task in one sentence.
-2. For large files: use search_file to locate the relevant region, then read_file
-   with start_line/end_line. Only read the sections you actually need.
-   For extraction tasks (imports, function names, class definitions, etc.) search_file
-   with a targeted pattern is faster and uses far less context than reading the whole file.
-   For small files: read_file with no range is fine.
+2. read_file returns AT MOST 300 lines. If the result says [END OF CHUNK], you have NOT
+   read the full file — call read_file again with the indicated start_line. Keep going
+   until you see [END OF FILE]. Never assume you have the whole file from one call.
+   — To understand a file without editing it: use summarise_file instead.
+   — To find a specific function/class/line: use search_file (faster, less context).
+   — To read a large file in full for editing: paginate with read_file + start_line.
 3. For external information (APIs, error codes, versions), call web_search.
 4. Form a concrete plan. Then execute it immediately — do not describe it.
 5. For non-trivial code, call consult_critic before the final write.
@@ -2385,6 +2944,31 @@ def _notify_async(title: str, messages: List[dict]) -> None:
 # ═══════════════════════════════════════════════════════════════════════════════
 # § 11  main()
 # ═══════════════════════════════════════════════════════════════════════════════
+
+
+def _check_complexity_async(state: AppState, task: str) -> None:
+    """Non-blocking llama3.2 call to suggest plan mode."""
+
+    def _run() -> None:
+        try:
+            resp = ollama.chat(
+                model=_SMALL_MODEL,
+                messages=[
+                    {
+                        "role": "user",
+                        "content": f"Is this coding task complex enough to need a step-by-step plan?\nTask: {task}\nReply YES or NO only.",
+                    }
+                ],
+                stream=False,
+            )
+            if (resp.message.content or "").strip().upper().startswith("YES"):
+                with state.lock:
+                    if state.model_busy:
+                        state.plan_hint = True
+        except Exception:
+            pass
+
+    threading.Thread(target=_run, daemon=True).start()
 
 
 def main(argv: Tuple[str, ...]) -> None:
@@ -2485,11 +3069,17 @@ def main(argv: Tuple[str, ...]) -> None:
                         state.running = False
                     break
 
-                # o — toggle think box
+                # o — toggle think box  (works while busy)
                 if key == "o":
                     with state.lock:
                         state.think_mode = (state.think_mode + 1) % 3
                         state.think_scroll = 0
+                    continue
+
+                # i — toggle plan view overlay  (works while busy)
+                if key == "i":
+                    with state.lock:
+                        state.show_plan_view = not state.show_plan_view
                     continue
 
                 # Scroll keys while model is busy: only inside expanded think box
@@ -2522,14 +3112,24 @@ def main(argv: Tuple[str, ...]) -> None:
                                 0, state.scroll_offset - _SCROLL_STEP
                             )
 
+                # tab — toggle plan mode on/off persistently
+                elif key == "\t":
+                    with state.lock:
+                        state.plan_enabled = not state.plan_enabled
+                    continue
+
                 # Space — enter prompt mode
                 elif key == " ":
+                    use_plan = state.plan_enabled
                     _leave_cbreak()
-                    raw_input = canvas.read_line("> ") or ""
+                    raw_input = (
+                        canvas.read_line("[PLAN] > " if use_plan else "> ") or ""
+                    )
                     _enter_cbreak()
 
                     with state.lock:
                         state.scroll_offset = 0
+                        state.plan_hint = False
 
                     if "\x1b" in raw_input:
                         continue  # cancelled
@@ -2550,8 +3150,12 @@ def main(argv: Tuple[str, ...]) -> None:
                         state.think_duration = 0.0
 
                     system_prompt = generate_system_prompt(str(root), user_input)
-                    worker.start(messages_snapshot, system_prompt, user_input)
+                    worker.start(
+                        messages_snapshot, system_prompt, user_input, plan_mode=use_plan
+                    )
                     _start_think_labeller(state)
+                    if not use_plan:
+                        _check_complexity_async(state, user_input)
 
             time.sleep(0.016)
 
