@@ -5,17 +5,32 @@ Usage:
     python main.py <directory_path>
 
 Layout:
-  § 1  Theme                     — colour palette (unchanged)
-  § 2  Symbol / TextBox / Canvas — terminal drawing primitives (unchanged)
-  § 3  AppState / ToolEvent      — clean shared state model
+  § 1  Theme                     — colour palette
+  § 2  Symbol / TextBox / Canvas — terminal drawing primitives
+  § 3  AppState / Application    — shared state + persistent history
   § 4  Tool schemas              — JSON tool definitions
   § 5  Tool implementations      — file I/O, shell, web, critic
   § 6  Think labeller            — background label-generator thread
-  § 7  AgentWorker               — streaming agentic loop (rewritten)
-  § 8  Renderer                  — render_frame (updated for clean model)
+  § 7  AgentWorker               — 8-step structured pipeline
+  § 8  Renderer                  — render_frame
   § 9  Filesystem / prompt       — tree builder + system prompt
   § 10 Notification              — post-turn desktop notify
   § 11 main()                    — event loop
+
+Agent pipeline (every turn):
+  1. User enters a prompt
+  2. Build system prompt with current file layout
+  3. Ask model for step-by-step plan          (temperature=0.5)
+  4. Summarise user prompt to one sentence    (temperature=0)
+  5. For each step:
+       5.1  Collect context: request + past tool calls + thinking summaries
+       5.2  Think + call tools until step is resolved
+       5.3  Ask model whether step goal was achieved; retry if not
+       5.4  Log tool usage; store thinking summary
+       5.5  Advance to next step
+  6. Ask model whether overall goal achieved; replan + restart if not
+  7. Ask model for human-readable output summary
+  8. Persist request / tool usage / summary to Application.history
 """
 
 from __future__ import annotations
@@ -473,7 +488,7 @@ class Canvas:
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# § 3  Shared state
+# § 3  Shared state  (AppState / Application / ToolEvent / TurnRecord)
 # ═══════════════════════════════════════════════════════════════════════════════
 
 
@@ -511,6 +526,23 @@ class TodoItem:
 
 
 @dataclass
+class TurnRecord:
+    """One completed user turn persisted in Application.history."""
+
+    request: str
+    tool_events: List["ToolEvent"]
+    summary: str
+    timestamp: float = field(default_factory=time.time)
+
+
+@dataclass
+class Application:
+    """Top-level application object; holds cross-turn persistent history."""
+
+    history: List[TurnRecord] = field(default_factory=list)
+
+
+@dataclass
 class AppState:
     # ── Conversation history ─────────────────────────────────────────────────
     messages: List[dict] = field(default_factory=list)
@@ -543,15 +575,11 @@ class AppState:
     # ── Confirm request (worker → main thread) ──────────────────────────────
     confirm_request: Optional["ConfirmRequest"] = None
 
-    # ── Plan mode ────────────────────────────────────────────────────────────
+    # ── Plan / step tracking ─────────────────────────────────────────────────
     todo_items: List["TodoItem"] = field(default_factory=list)
-    plan_mode: bool = False
-    plan_hint: bool = False
-    plan_enabled: bool = False  # persistent toggle: tab key
     show_plan_view: bool = False  # i key: overlay showing full plan
-    task_work_done: bool = (
-        False  # set True when a mutating tool runs; reset on complete_task
-    )
+    step_phase: str = ""  # "planning" / "step N/M" / "verifying" / …
+    replan_count: int = 0
 
     # ── Completed-turn summary (shown in chat after busy = False) ────────────
     last_turn_tools: List[ToolEvent] = field(default_factory=list)
@@ -1104,37 +1132,6 @@ def _tool_web_search(query: str) -> str:
     )
 
 
-def _tool_complete_task(state: "AppState", index: int) -> str:
-    """Mark task *index* (1-based) done, enforcing sequential order."""
-    with state.lock:
-        items = state.todo_items
-        if not items:
-            return "[ERROR] No active plan."
-        next_idx = next((i for i, t in enumerate(items) if not t.done), None)
-        if next_idx is None:
-            return "All tasks are already complete."
-        expected = next_idx + 1
-        if index != expected:
-            return (
-                f"[ERROR] Must complete tasks in order. "
-                f'Next task is #{expected}: "{items[next_idx].text}". '
-                f"Finish that one first."
-            )
-        if not state.task_work_done:
-            return (
-                f"[ERROR] You have not performed any file or command operations for task "
-                f"#{expected}. You must write_file, create_file, or run_command before "
-                f"calling complete_task. Do the actual work first."
-            )
-        items[next_idx].done = True
-        state.task_work_done = False  # reset for next task
-        remaining = sum(1 for t in items if not t.done)
-        return (
-            f'Task #{expected} complete: "{items[next_idx].text}". '
-            f"{remaining} task{'s' if remaining != 1 else ''} remaining."
-        )
-
-
 def _tool_consult_critic(plan: str) -> str:
     """Run *plan* through an adversarial critic instance and return its verdict."""
     _CRITIC_SYSTEM = (
@@ -1231,7 +1228,7 @@ def _start_think_labeller(state: AppState) -> None:
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# § 7  AgentWorker  — streaming agentic loop
+# § 7  AgentWorker  — 8-step structured pipeline
 # ═══════════════════════════════════════════════════════════════════════════════
 
 _SPINNER = ["·", "✻", "✽", "✶", "✳", "✢", "✳", "✶", "✽", "✻"]
@@ -1239,17 +1236,22 @@ _SPINNER = ["·", "✻", "✽", "✶", "✳", "✢", "✳", "✶", "✽", "✻"]
 
 class AgentWorker:
     """
-    Streams Ollama responses on a background daemon thread.
+    Runs the structured 8-step agent pipeline on a background daemon thread.
 
-    Correct Ollama tool-calling loop (per official docs):
-        1. Call ollama.chat(..., think=True, stream=True)
-        2. Stream thinking tokens → show live; stream content tokens → show live
-        3. Collect tool_calls from stream chunks
-        4. Append the assembled assistant message to history  ← this is the key
-        5. Execute each tool call; append {"role":"tool","tool_name":fn,...} results
-        6. Call ollama.chat again with the same history — the model sees its own
-           prior tool calls and results and continues naturally. No injection needed.
-        7. Repeat until a turn produces no tool_calls.
+    Pipeline per user turn:
+        1. User enters a prompt
+        2. System prompt is built with current file layout            (caller)
+        3. Ask model to create a step-by-step plan                   (temp=0.5)
+        4. Summarise user prompt into one tight sentence             (temp=0)
+        5. For each step:
+             5.1  Collect context: request + past tool calls + think summaries
+             5.2  Think + call tools until step resolved
+             5.3  Ask model whether step goal was achieved; retry if not
+             5.4  Log tool usage; store thinking summary
+             5.5  Advance to next step
+        6. Ask model whether overall goal achieved; replan+restart if not
+        7. Ask model for human-readable output summary
+        8. Persist request / tool usage / summary to Application.history
     """
 
     _PENDING_VERB: Dict[str, str] = {
@@ -1271,12 +1273,14 @@ class AgentWorker:
         "consult_critic": "critic reviewed",
     }
 
-    def __init__(self, state: AppState, canvas: Canvas, root: Path) -> None:
+    def __init__(
+        self, state: AppState, canvas: Canvas, root: Path, app: "Application"
+    ) -> None:
         self._state = state
         self._canvas = canvas
         self._root = root
+        self._app = app
         self._task = ""
-        self._plan_mode = False
 
     # ── Public API ────────────────────────────────────────────────────────────
 
@@ -1285,182 +1289,217 @@ class AgentWorker:
         messages: List[dict],
         system_prompt: str,
         task: str = "",
-        plan_mode: bool = False,
     ) -> None:
         self._task = task.strip()
-        self._plan_mode = plan_mode
         threading.Thread(
             target=self._run,
             args=(list(messages), system_prompt),
             daemon=True,
         ).start()
 
-    # ── Private: main loop ────────────────────────────────────────────────────
+    # ── Private: 8-step pipeline ─────────────────────────────────────────────
 
     def _run(self, messages: List[dict], system_prompt: str) -> None:
+        """Orchestrates the full 8-step pipeline for one user turn."""
         with self._state.lock:
             self._state.tool_events = []
             self._state.think_output = ""
             self._state.current_output = ""
             self._state.reply_started = False
             self._state.todo_items = []
-            self._state.plan_mode = self._plan_mode
-            self._state.plan_hint = False
-            self._state.task_work_done = False
+            self._state.step_phase = "planning"
+            self._state.replan_count = 0
 
-        if self._plan_mode and self._task:
-            self._run_planner()
-            with self._state.lock:
-                has_plan = bool(self._state.todo_items)
-            if has_plan:
-                self._run_plan_mode(messages, system_prompt)
-                return
-
-        # ── Normal (non-plan) mode ────────────────────────────────────────────
+        task = self._task
         history: List[dict] = list(messages)
-        think_acc = ""
-        output_acc = ""
-        try:
-            while True:
-                if self._stopped():
-                    break
-                content, think_chunk, tool_calls, asst_msg = self._stream_one_turn(
-                    history, system_prompt, think_acc
-                )
-                think_acc += think_chunk
-                output_acc = content
-                history.append(asst_msg)
-                if not tool_calls:
-                    break
-                with self._state.lock:
-                    self._state.reply_started = False
-                    self._state.current_output = ""
-                think_acc = self._execute_tool_calls(tool_calls, history, think_acc)
-        except Exception as exc:
-            output_acc = f"[ERROR] {exc}"
-            with self._state.lock:
-                self._state.current_output = output_acc
-        finally:
-            self._finalize(output_acc)
-
-    def _run_plan_mode(self, messages: List[dict], system_prompt: str) -> None:
-        """Execute the task list one item at a time.
-
-        For each task:
-          1. Record where history ends before the task starts.
-          2. Run the agent until it finishes (any_work_done + no more tool calls).
-          3. Compress the raw tool messages from that task into a single summary
-             entry in history (context compression — prevents window bloat).
-          4. Tick the task and advance.
-
-        When the plan finishes, history is the authoritative record and is
-        written back to state.messages so the next user turn has full context.
-        """
-        history: List[dict] = list(messages)
-        completed_summaries: List[str] = []  # passed to each task for context
         output_acc = ""
 
         try:
-            while True:
+            # ── Step 3: build plan (temperature=0.5) ─────────────────────────
+            steps = self._make_plan(system_prompt, task)
+
+            # ── Step 4: summarise request (temperature=0) ────────────────────
+            task_summary = self._summarise_request(task)
+
+            all_tool_events: List[ToolEvent] = []
+            all_think_summaries: List[str] = []
+
+            _MAX_REPLANS = 2
+            for replan_attempt in range(_MAX_REPLANS + 1):
                 if self._stopped():
                     break
 
+                # Populate UI todo list for this plan iteration
                 with self._state.lock:
-                    todo = list(self._state.todo_items)
-                pending = [t for t in todo if not t.done]
+                    self._state.todo_items = [TodoItem(text=s) for s in steps]
+                    self._state.replan_count = replan_attempt
 
-                if not pending:
-                    break
+                plan_complete = True
 
-                task = pending[0]
+                for step_idx, step_text in enumerate(steps):
+                    if self._stopped():
+                        plan_complete = False
+                        break
 
-                # upcoming tasks the model must NOT start yet
-                upcoming = [t.text for t in todo if not t.done and t is not task]
+                    # ── 5.1 Update UI ─────────────────────────────────────────
+                    with self._state.lock:
+                        self._state.step_phase = f"step {step_idx + 1}/{len(steps)}"
+                        self._state.think_output = ""
+                        self._state.current_output = ""
+                        self._state.reply_started = False
+                        self._state.tool_events = []
 
-                # Clear per-task UI state
-                with self._state.lock:
-                    self._state.think_output = ""
-                    self._state.current_output = ""
-                    self._state.reply_started = False
-                    self._state.task_work_done = False
-                    self._state.tool_events = []
+                    history_len_before = len(history)
 
-                # Snapshot history length so we can compress after
-                history_len_before = len(history)
+                    # ── 5.2 / 5.3: Execute with retry on step-goal check ──────
+                    _MAX_STEP_RETRIES = 2
+                    step_ok = False
+                    think_acc = ""
 
-                task_done = self._run_one_task(
-                    task.text,
-                    history,
-                    system_prompt,
-                    completed_summaries=completed_summaries,
-                    upcoming_tasks=upcoming,
-                )
+                    for retry in range(_MAX_STEP_RETRIES):
+                        if self._stopped():
+                            break
 
-                if self._stopped():
-                    break
+                        context_block = self._build_step_context(
+                            task_summary, all_tool_events, all_think_summaries
+                        )
+                        completed_steps = [
+                            s for i, s in enumerate(steps) if i < step_idx
+                        ]
+                        upcoming_steps = [
+                            s for i, s in enumerate(steps) if i > step_idx
+                        ]
 
-                if not task_done:
-                    err = f'[plan] Could not complete: "{task.text}". Stopping.'
+                        step_sys = self._build_step_system(
+                            system_prompt,
+                            context_block,
+                            step_text,
+                            step_idx,
+                            len(steps),
+                            completed_steps,
+                            upcoming_steps,
+                        )
+
+                        # ── 5.2 think + call tools ────────────────────────────
+                        think_acc = self._execute_step(
+                            step_text, history, step_sys, think_acc
+                        )
+
+                        # ── 5.3 check step goal ───────────────────────────────
+                        step_ok = self._check_step_goal(step_text, history)
+
+                        # ── 5.4 log tool usage + thinking summary ─────────────
+                        with self._state.lock:
+                            step_events = list(self._state.tool_events)
+                        all_tool_events.extend(step_events)
+                        if think_acc.strip():
+                            all_think_summaries.append(
+                                self._compress_thinking(think_acc)
+                            )
+
+                        if step_ok:
+                            break
+
+                        # Not yet achieved — nudge for retry
+                        if retry < _MAX_STEP_RETRIES - 1:
+                            history.append(
+                                {
+                                    "role": "user",
+                                    "content": (
+                                        f'The step "{step_text}" has not been fully '
+                                        "achieved. Please complete it now using the "
+                                        "appropriate tool call."
+                                    ),
+                                }
+                            )
+
+                    # ── 5.4 snapshot last-turn tools for UI ───────────────────
+                    with self._state.lock:
+                        last_tools = list(self._state.tool_events)
+                        self._state.last_turn_tools = last_tools
+                        self._state.tool_events = []
+
+                    # ── Context compression ───────────────────────────────────
+                    step_summary = self._summarise_step(step_text, history)
+                    mutating = {
+                        "write_file",
+                        "create_file",
+                        "run_command",
+                        "delete_file",
+                    }
+                    files_done = [
+                        ev.label
+                        for ev in last_tools
+                        if ev.status == ToolStatus.DONE and ev.name in mutating
+                    ]
+                    compressed = (
+                        f"{step_summary}\nFiles changed: {', '.join(files_done)}"
+                        if files_done
+                        else step_summary
+                    )
+                    del history[history_len_before:]
+                    history.append({"role": "assistant", "content": compressed})
+
+                    # Show step completion in chat
                     with self._state.lock:
                         self._state.messages.append(
-                            {"role": "assistant", "content": err}
+                            {"role": "assistant", "content": compressed}
                         )
+                        self._state.current_output = ""
+                        self._state.reply_started = False
+
+                    # ── 5.5 tick step done ────────────────────────────────────
+                    with self._state.lock:
+                        if step_idx < len(self._state.todo_items):
+                            self._state.todo_items[step_idx].done = True
+
+                    if not step_ok:
+                        plan_complete = False
+                        break
+
+                if self._stopped():
                     break
 
-                # Snapshot tool events for the UI before clearing
+                # ── Step 6: check overall goal ────────────────────────────────
                 with self._state.lock:
-                    last_tools = list(self._state.tool_events)
-                    self._state.last_turn_tools = last_tools
+                    self._state.step_phase = "verifying"
 
-                # Tick the task
-                with self._state.lock:
-                    if not task.done:
-                        task.done = True
-                    self._state.task_work_done = False
-                    self._state.tool_events = []
+                overall_ok = self._check_overall_goal(task_summary, history)
 
-                # Build summary sentence
-                summary = self._summarize_task(task.text, history)
+                if overall_ok:
+                    break
 
-                # ── Context compression ──────────────────────────────────────
-                # Replace everything _run_one_task added to history with a richer
-                # but compact entry: summary + list of files touched.
-                # This prevents raw file dumps from accumulating across tasks
-                # while giving the model enough context to avoid re-doing work.
-                mutating = {"write_file", "create_file", "run_command", "delete_file"}
-                files_done = [
-                    ev.label
-                    for ev in last_tools
-                    if ev.status == ToolStatus.DONE and ev.name in mutating
-                ]
-                if files_done:
-                    compressed_content = (
-                        f"{summary}\nFiles changed: {', '.join(files_done)}"
-                    )
-                else:
-                    compressed_content = summary
+                if replan_attempt < _MAX_REPLANS:
+                    # Replan and restart
+                    with self._state.lock:
+                        self._state.step_phase = "replanning"
+                    prev_ctx = "\n".join(all_think_summaries[-4:])
+                    steps = self._make_plan(system_prompt, task, prior_context=prev_ctx)
+                    all_tool_events = []
+                    all_think_summaries = []
 
-                del history[history_len_before:]  # drop raw tool messages
-                history.append({"role": "assistant", "content": compressed_content})
+            # ── Step 7: human-readable output summary ─────────────────────────
+            with self._state.lock:
+                self._state.step_phase = "summarising"
 
-                # Track for subsequent tasks' context prompts
-                completed_summaries.append(compressed_content)
+            output_acc = self._generate_output_summary(task_summary, history)
 
-                # Show the plain summary in chat (same text, no prefix — so
-                # state.messages = history[:] at the end causes no visual change)
-                with self._state.lock:
-                    self._state.messages.append(
-                        {"role": "assistant", "content": compressed_content}
-                    )
-                    self._state.current_output = ""
-                    self._state.reply_started = False
+            with self._state.lock:
+                self._state.current_output = output_acc
+                self._state.reply_started = True
 
-            # Sync: history is the authoritative record for the next user turn
+            # ── Step 8: persist to Application.history ────────────────────────
+            self._app.history.append(
+                TurnRecord(
+                    request=task,
+                    tool_events=list(all_tool_events),
+                    summary=output_acc,
+                )
+            )
+
             with self._state.lock:
                 self._state.messages = history[:]
 
-            output_acc = ""
-
         except Exception as exc:
             output_acc = f"[ERROR] {exc}"
             with self._state.lock:
@@ -1469,62 +1508,168 @@ class AgentWorker:
         finally:
             self._finalize(output_acc)
 
-    def _run_one_task(
-        self,
-        task_text: str,
-        history: List[dict],
-        system_prompt: str,
-        completed_summaries: Optional[List[str]] = None,
-        upcoming_tasks: Optional[List[str]] = None,
-    ) -> bool:
-        """Run the agent loop for a single plan task.
+    # ── Step 3: create plan ───────────────────────────────────────────────────
 
-        Exits when the model produces a turn with NO tool calls after at least
-        one mutating tool has succeeded — this allows tasks that require multiple
-        writes (e.g. write two files) to complete naturally.
+    def _make_plan(
+        self, system_prompt: str, task: str, prior_context: str = ""
+    ) -> List[str]:
+        """Ask the main model for a numbered step list. temperature=0.5."""
+        with self._state.lock:
+            self._state.step_phase = "planning"
 
-        Returns True if any work was done, False if the safety cap was hit or
-        the agent was stopped before doing anything.
-        """
-        think_acc = ""
-        max_turns = 15
-        any_work_done = False
-
-        for _ in range(max_turns):
-            if self._stopped():
-                return False
-
-            # Build context blocks for the system prompt
-            done_block = ""
-            if completed_summaries:
-                lines = "\n".join(f"  ✓ {s}" for s in completed_summaries)
-                done_block = (
-                    "\n\nALREADY COMPLETED — do not redo or touch these:\n" + lines
-                )
-
-            upcoming_block = ""
-            if upcoming_tasks:
-                lines = "\n".join(f"  → {t}" for t in upcoming_tasks)
-                upcoming_block = (
-                    "\n\nUPCOMING TASKS — do NOT start these yet, even if it seems efficient:\n"
-                    + lines
-                )
-
-            _sys = system_prompt + (
-                "\n\n════════════════════════════════════════\n"
-                "CURRENT TASK (do this and only this)\n"
-                "════════════════════════════════════════\n"
-                f"{task_text}"
-                f"{done_block}"
-                f"{upcoming_block}\n\n"
-                "Use write_file, create_file, run_command, or delete_file to complete\n"
-                "the CURRENT TASK only. When all required tool calls are done, stop\n"
-                "calling tools and write one short sentence confirming what you did."
+        extra = (
+            f"\n\nPrevious attempt context (use to improve the plan):\n{prior_context}"
+            if prior_context
+            else ""
+        )
+        prompt = (
+            "You are a task planner for a coding agent.\n"
+            f"Overall task: {task}{extra}\n\n"
+            "Break this into sequential, atomic steps. Each step must:\n"
+            "— Be a single concrete action (write_file, create_file, or run_command).\n"
+            "— Name the exact file and describe exactly what it should contain.\n"
+            "— NOT include reading, searching, or planning sub-steps.\n"
+            "\n"
+            "Reply ONLY with a numbered list. No preamble, no commentary.\n\nSteps:"
+        )
+        try:
+            resp = ollama.chat(
+                model=_MODEL,
+                messages=[{"role": "user", "content": prompt}],
+                stream=False,
+                options={"temperature": 0.5},
             )
+            raw = re.sub(
+                r"<think>.*?</think>",
+                "",
+                resp.message.content or "",
+                flags=re.DOTALL,
+            ).strip()
+            steps: List[str] = []
+            for line in raw.splitlines():
+                m = re.match(
+                    r"^\s*(?:[Ss]tep\s*)?\d+[.):\-]\s+(.*)|^[-*]\s+(.*)",
+                    line.strip(),
+                )
+                if m:
+                    text = (m.group(1) or m.group(2) or "").strip()
+                    if text:
+                        steps.append(text)
+            return steps if steps else [task]
+        except Exception:
+            return [task]
+
+    # ── Step 4: summarise request ─────────────────────────────────────────────
+
+    def _summarise_request(self, task: str) -> str:
+        """Compress the user prompt to one tight sentence. temperature=0."""
+        try:
+            resp = ollama.chat(
+                model=_SMALL_MODEL,
+                messages=[
+                    {
+                        "role": "user",
+                        "content": (
+                            "Summarise this task in ONE tight sentence (max 20 words): "
+                            + task
+                        ),
+                    }
+                ],
+                stream=False,
+                options={"temperature": 0, "num_predict": 40},
+            )
+            return (
+                re.sub(
+                    r"<think>.*?</think>",
+                    "",
+                    resp.message.content or "",
+                    flags=re.DOTALL,
+                )
+                .strip()
+                .split("\n")[0]
+            )
+        except Exception:
+            return task[:100]
+
+    # ── Step 5.1: build context block ─────────────────────────────────────────
+
+    def _build_step_context(
+        self,
+        task_summary: str,
+        tool_events: List[ToolEvent],
+        think_summaries: List[str],
+    ) -> str:
+        """Assemble a compact context block for the current step's system prompt."""
+        parts = [f"Overall request: {task_summary}"]
+        if tool_events:
+            recent = tool_events[-10:]
+            lines = [
+                f"  {ev.status.name}: {ev.label}" + (f"  {ev.stat}" if ev.stat else "")
+                for ev in recent
+            ]
+            parts.append("Past tool calls:\n" + "\n".join(lines))
+        if think_summaries:
+            recent_s = think_summaries[-3:]
+            parts.append(
+                "Previous step summaries:\n" + "\n".join(f"  — {s}" for s in recent_s)
+            )
+        return "\n\n".join(parts)
+
+    def _build_step_system(
+        self,
+        base_sys: str,
+        context_block: str,
+        step_text: str,
+        step_idx: int,
+        total_steps: int,
+        completed_steps: List[str],
+        upcoming_steps: List[str],
+    ) -> str:
+        """Build the system prompt for executing one step."""
+        done_block = (
+            "\n\nALREADY COMPLETED — do not redo:\n"
+            + "\n".join(f"  ✓ {s}" for s in completed_steps)
+            if completed_steps
+            else ""
+        )
+        upcoming_block = (
+            "\n\nUPCOMING — do NOT start yet:\n"
+            + "\n".join(f"  → {s}" for s in upcoming_steps)
+            if upcoming_steps
+            else ""
+        )
+        return (
+            base_sys
+            + "\n\n════════════════════════════════════════\n"
+            + f"CONTEXT\n{context_block}\n"
+            + "════════════════════════════════════════\n"
+            + f"CURRENT STEP ({step_idx + 1}/{total_steps}) — do this and ONLY this:\n"
+            + step_text
+            + done_block
+            + upcoming_block
+            + "\n\nUse write_file, create_file, run_command, or delete_file to complete "
+            "the step. When all required tool calls are done, write one short sentence "
+            "confirming what you did."
+        )
+
+    # ── Step 5.2: execute step tool loop ─────────────────────────────────────
+
+    def _execute_step(
+        self,
+        step_text: str,
+        history: List[dict],
+        step_sys: str,
+        think_acc: str,
+    ) -> str:
+        """Run the tool-call loop for one step. Returns accumulated think text."""
+        _MAX_TURNS = 12
+        for _ in range(_MAX_TURNS):
+            if self._stopped():
+                break
 
             content, think_chunk, tool_calls, asst_msg = self._stream_one_turn(
                 history,
-                _sys,
+                step_sys,
                 think_acc,
                 temperature=0.3,
                 inject_plan=False,
@@ -1534,101 +1679,109 @@ class AgentWorker:
             history.append(asst_msg)
 
             if not tool_calls:
-                if any_work_done:
-                    # Work is done, model has confirmed — suppress the confirmation
-                    # text from appearing in the chat (it will vanish when cleared)
-                    with self._state.lock:
-                        self._state.current_output = ""
-                        self._state.reply_started = False
-                    return True
-                # No tools, no prior work — nudge
                 with self._state.lock:
                     self._state.current_output = ""
                     self._state.reply_started = False
-                history.append(
-                    {
-                        "role": "user",
-                        "content": (
-                            f'You have not completed the task yet: "{task_text}". '
-                            "Call write_file, create_file, run_command, or delete_file. "
-                            "Do not write text — call a tool."
-                        ),
-                    }
-                )
-                continue
+                break
 
             with self._state.lock:
                 self._state.reply_started = False
                 self._state.current_output = ""
 
             think_acc = self._execute_tool_calls(tool_calls, history, think_acc)
+            for tool_call in tool_calls:
+                self._execute_tool(tool_call)
 
-            with self._state.lock:
-                if self._state.task_work_done:
-                    any_work_done = True
-                    self._state.task_work_done = False
-
-        return any_work_done
-
-    def _execute_tool_calls(
-        self,
-        tool_calls: List[Any],
-        history: List[dict],
-        think_acc: str,
-    ) -> str:
-        """Execute a list of tool calls, update history and think display.
-        Returns the updated think_acc string."""
-        for tc in tool_calls:
-            fn = tc.function.name
-            args = tc.function.arguments
-            if isinstance(args, str):
-                try:
-                    args = json.loads(args)
-                except Exception:
-                    args = {}
-
-            before_lines = self._snapshot_lines(fn, args)
-            event = self._push_tool_event(fn, args)
-            pending_sentinel = f"\x00TOOL_PENDING\x00{event.label}…"
-            think_acc += f"\n{pending_sentinel}"
-            with self._state.lock:
-                self._state.think_output = think_acc
-
-            result = self._execute_tool(fn, args)
-
-            stat = self._compute_stat(fn, args, before_lines)
-            self._resolve_tool_event(event, result, stat)
-            is_error = result.startswith("[ERROR]")
-            done_sentinel = (
-                f"\x00TOOL_ERROR\x00{event.label}"
-                if is_error
-                else f"\x00TOOL_DONE\x00{event.label}{stat}"
-            )
-            think_acc = think_acc.replace(pending_sentinel, done_sentinel) + "\n"
-            with self._state.lock:
-                self._state.think_output = think_acc
-
-            history.append(
-                {
-                    "role": "tool",
-                    "tool_name": fn,
-                    "content": result,
-                }
-            )
         return think_acc
 
-    def _summarize_task(self, task_text: str, history: List[dict]) -> str:
-        """Ask llama3.2 for a one-line summary of what was done for this task."""
-        # Grab the last few history entries as context (avoid huge payloads)
+    # ── Step 5.3: check step goal ─────────────────────────────────────────────
+
+    def _check_step_goal(self, step_text: str, history: List[dict]) -> bool:
+        """Ask small model if step goal was achieved. YES/NO, temperature=0."""
+        recent = history[-6:]
+        ctx = "\n".join(
+            f"{m['role']}: {str(m.get('content', ''))[:300]}" for m in recent
+        )
+        try:
+            resp = ollama.chat(
+                model=_SMALL_MODEL,
+                messages=[
+                    {
+                        "role": "user",
+                        "content": (
+                            f"Step goal: {step_text}\n\n"
+                            f"Recent actions:\n{ctx}\n\n"
+                            "Was this step goal fully achieved? Reply YES or NO only."
+                        ),
+                    }
+                ],
+                stream=False,
+                options={"temperature": 0, "num_predict": 5},
+            )
+            ans = (
+                re.sub(
+                    r"<think>.*?</think>",
+                    "",
+                    resp.message.content or "",
+                    flags=re.DOTALL,
+                )
+                .strip()
+                .upper()
+            )
+            return ans.startswith("YES")
+        except Exception:
+            return True  # assume ok on model error
+
+    # ── Step 5.4: compress thinking for context carry-over ────────────────────
+
+    def _compress_thinking(self, think_acc: str) -> str:
+        """Return a short summary of the thinking text for future step context."""
+        clean = re.sub(r"</?think>", "", think_acc).strip()
+        if not clean:
+            return ""
+        paras = [p.strip() for p in re.split(r"\n{2,}", clean) if p.strip()]
+        excerpt = "\n".join(paras[-3:])[:500]
+        try:
+            resp = ollama.chat(
+                model=_SMALL_MODEL,
+                messages=[
+                    {
+                        "role": "user",
+                        "content": (
+                            "Summarise this agent thinking in ONE sentence (max 20 words): "
+                            + excerpt
+                        ),
+                    }
+                ],
+                stream=False,
+                options={"temperature": 0, "num_predict": 30},
+            )
+            return (
+                re.sub(
+                    r"<think>.*?</think>",
+                    "",
+                    resp.message.content or "",
+                    flags=re.DOTALL,
+                )
+                .strip()
+                .split("\n")[0]
+            )
+        except Exception:
+            return excerpt[:80]
+
+    # ── Step 5 helper: summarise completed step for history compression ───────
+
+    def _summarise_step(self, step_text: str, history: List[dict]) -> str:
+        """One-line summary of what was accomplished for history compression."""
         recent = history[-6:]
         ctx = "\n".join(
             f"{m['role']}: {str(m.get('content', ''))[:300]}" for m in recent
         )
         prompt = (
-            f"Task: {task_text}\n\n"
+            f"Task: {step_text}\n\n"
             f"Recent actions:\n{ctx}\n\n"
             "Write ONE short sentence (max 15 words) summarising what was just done. "
-            "No preamble, no quotes, just the sentence."
+            "No preamble, no quotes."
         )
         try:
             resp = ollama.chat(
@@ -1637,60 +1790,85 @@ class AgentWorker:
                 stream=False,
                 options={"temperature": 0},
             )
-            return (resp.message.content or "").strip().split("\n")[0]
+            return (
+                re.sub(
+                    r"<think>.*?</think>",
+                    "",
+                    resp.message.content or "",
+                    flags=re.DOTALL,
+                )
+                .strip()
+                .split("\n")[0]
+            )
         except Exception:
-            return f"Completed: {task_text}"
+            return f"Completed: {step_text}"
 
-    # ── Private: stream one model turn ───────────────────────────────────────
+    # ── Step 6: check overall goal ────────────────────────────────────────────
 
-    def _run_planner(self) -> None:
-        """Break self._task into ordered steps via llama3.2, populate state.todo_items."""
+    def _check_overall_goal(self, task_summary: str, history: List[dict]) -> bool:
+        """Ask small model if overall goal was fully achieved. YES/NO, temp=0."""
+        recent = history[-8:]
+        ctx = "\n".join(
+            f"{m['role']}: {str(m.get('content', ''))[:300]}" for m in recent
+        )
+        try:
+            resp = ollama.chat(
+                model=_SMALL_MODEL,
+                messages=[
+                    {
+                        "role": "user",
+                        "content": (
+                            f"Overall goal: {task_summary}\n\n"
+                            f"Work done:\n{ctx}\n\n"
+                            "Was the overall goal fully achieved? Reply YES or NO only."
+                        ),
+                    }
+                ],
+                stream=False,
+                options={"temperature": 0, "num_predict": 5},
+            )
+            ans = (
+                re.sub(
+                    r"<think>.*?</think>",
+                    "",
+                    resp.message.content or "",
+                    flags=re.DOTALL,
+                )
+                .strip()
+                .upper()
+            )
+            return ans.startswith("YES")
+        except Exception:
+            return True
+
+    # ── Step 7: generate output summary ──────────────────────────────────────
+
+    def _generate_output_summary(self, task_summary: str, history: List[dict]) -> str:
+        """Ask main model for a short human-readable summary of what was done."""
         prompt = (
-            f"You are a task planner for a coding agent.\n"
-            f"Overall task: {self._task}\n\n"
-            "Break this into sequential steps. Each step must:\n"
-            "— Be a SINGLE file operation (one write_file, one create_file, or one run_command).\n"
-            "— Be completable in ONE tool call with no reading required.\n"
-            "— Be specific: name the exact file and what goes in it.\n"
-            "— NOT include reading, searching, or planning sub-steps — those are implicit.\n"
-            "\n"
-            "Good examples:\n"
-            "1. create README.md with project title and one-paragraph description\n"
-            "2. add installation instructions section to README.md\n"
-            "3. write src/utils.py with helper functions X and Y\n"
-            "\n"
-            "Bad examples (too vague or multi-step):\n"
-            "1. set up the project  ← too vague\n"
-            "2. read and update main.py  ← reading is implicit, not a step\n"
-            "3. implement the whole feature  ← not atomic\n"
-            "\n"
-            "Reply ONLY with the numbered list. No preamble, no commentary.\n\nSteps:"
+            f"Task completed: {task_summary}\n\n"
+            "Write a SHORT plain-text summary of what was accomplished. "
+            "MAX 4 lines. No markdown, no code blocks. "
+            "Format: one sentence of what was done, then 'filename — what changed' "
+            "for each file (if any), then any required user action on the last line."
         )
         try:
             resp = ollama.chat(
                 model=_MODEL,
-                messages=[{"role": "user", "content": prompt}],
+                messages=history[-6:] + [{"role": "user", "content": prompt}],
                 stream=False,
-                options={"temperature": 0.4},
+                options={"temperature": 0},
             )
-            raw = (resp.message.content or "").strip()
-            # Strip any <think>...</think> block qwen3 may emit before the list
-            raw = re.sub(r"<think>.*?</think>", "", raw, flags=re.DOTALL).strip()
-            items: List[TodoItem] = []
-            for line in raw.splitlines():
-                line = line.strip()
-                # Accept: "1. foo", "1) foo", "Step 1. foo", "Step 1: foo", "- foo", "* foo"
-                m = re.match(r"^\s*(?:[Ss]tep\s*)?\d+[.):\-]\s+(.*)|^[-*]\s+(.*)", line)
-                if m:
-                    text = (m.group(1) or m.group(2) or "").strip()
-                    if text:
-                        items.append(TodoItem(text=text))
-            if items:
-                with self._state.lock:
-                    self._state.todo_items = items
+            return re.sub(
+                r"<think>.*?</think>",
+                "",
+                resp.message.content or "",
+                flags=re.DOTALL,
+            ).strip()
         except Exception:
-            pass
+            return f"Completed: {task_summary}"
 
+    # ── Private: stream one model turn ───────────────────────────────────────
     def _stream_one_turn(
         self,
         history: List[dict],
@@ -1878,11 +2056,7 @@ class AgentWorker:
                 return "[ERROR] Path is outside the project directory."
             if not str(path).startswith(str(self._root)):
                 return "[ERROR] write_file is restricted to the project directory."
-            result = _tool_write_file(path, rel, args.get("content", ""))
-            if not result.startswith("[ERROR]"):
-                with self._state.lock:
-                    self._state.task_work_done = True
-            return result
+            return _tool_write_file(path, rel, args.get("content", ""))
 
         elif name == "create_file":
             rel = args.get("path", "")
@@ -1891,11 +2065,7 @@ class AgentWorker:
                 return "[ERROR] Path is outside the project directory."
             if not str(path).startswith(str(self._root)):
                 return "[ERROR] create_file is restricted to the project directory."
-            result = _tool_create_file(path, rel, args.get("content", ""))
-            if not result.startswith("[ERROR]"):
-                with self._state.lock:
-                    self._state.task_work_done = True
-            return result
+            return _tool_create_file(path, rel, args.get("content", ""))
 
         elif name == "delete_file":
             rel = args.get("path", "")
@@ -1906,11 +2076,7 @@ class AgentWorker:
                 return "[ERROR] delete_file is restricted to the project directory."
             if not self._confirm(f"Delete '{rel}'? [y/N]: "):
                 return "CANCELLED: user declined deletion."
-            result = _tool_delete_file(path, rel)
-            if not result.startswith("[ERROR]"):
-                with self._state.lock:
-                    self._state.task_work_done = True
-            return result
+            return _tool_delete_file(path, rel)
 
         elif name == "run_command":
             cmd = args.get("command", "").strip()
@@ -1919,22 +2085,13 @@ class AgentWorker:
             # cwd is always the project root — the AI must not change it
             if not self._confirm(f"Run: {cmd}  [y/N]: "):
                 return "CANCELLED: user declined command."
-            result = _tool_run_command(cmd, self._root)
-            with self._state.lock:
-                self._state.task_work_done = True
-            return result
+            return _tool_run_command(cmd, self._root)
 
         elif name == "web_search":
             query = args.get("query", "").strip()
             if not query:
                 return "[ERROR] No query provided."
             return _tool_web_search(query)
-
-        elif name == "complete_task":
-            idx = args.get("index")
-            if idx is None:
-                return "[ERROR] No index provided."
-            return _tool_complete_task(self._state, int(idx))
 
         elif name == "consult_critic":
             plan = args.get("plan", "").strip()
@@ -2501,11 +2658,11 @@ def render_frame(canvas: Canvas, state: AppState, tick: int) -> None:
         think_scroll = state.think_scroll
         reply_started = state.reply_started
         todo_items = list(state.todo_items)
-        plan_hint = state.plan_hint
-        plan_enabled = state.plan_enabled
         show_plan_view = state.show_plan_view
+        step_phase = state.step_phase
+        replan_count = state.replan_count
 
-    PLAN_ROWS = 1 if (todo_items or plan_enabled or plan_hint) else 0
+    PLAN_ROWS = 1 if (todo_items or (busy and step_phase)) else 0
     STATUS_ROW = H - 1 - PLAN_ROWS
 
     username = getpass.getuser()
@@ -2622,7 +2779,7 @@ def render_frame(canvas: Canvas, state: AppState, tick: int) -> None:
         hint = "↑↓ scroll   ␣ type"
         canvas.text(max(0, (W - len(hint)) // 2), STATUS_ROW, Theme.HINT_SCROLL + hint)
     else:
-        hint = "↑↓ scroll   ␣ type   ⇥ plan   i view plan   o thinking"
+        hint = "↑↓ scroll   ␣ type   i view plan   o thinking"
         canvas.text(max(0, (W - len(hint)) // 2), STATUS_ROW, Theme.HINT + hint)
 
     # ── Plan strip ─────────────────────────────────────────────────────────
@@ -2633,21 +2790,21 @@ def render_frame(canvas: Canvas, state: AppState, tick: int) -> None:
             total_count = len(todo_items)
             active = next((t for t in todo_items if not t.done), None)
             active_text = active.text if active else "all done"
-            plan_str = f"plan {done_count}/{total_count}  {active_text}"
+            replan_tag = f" [replan {replan_count}]" if replan_count else ""
+            phase_tag = f" · {step_phase}" if step_phase else ""
+            plan_str = (
+                f"{done_count}/{total_count}{replan_tag}{phase_tag}  {active_text}"
+            )
             if len(plan_str) > W - 4:
                 plan_str = plan_str[: W - 7] + "..."
             canvas.text(1, plan_row, f"%color(80,80,80) {plan_str} ")
-        elif plan_enabled:
-            canvas.text(1, plan_row, "%color(55,55,80) plan mode on · ⇥ to disable ")
-        elif plan_hint and not busy:
-            canvas.text(
-                1, plan_row, "%color(70,70,90) ⇥ · enable plan mode for this task "
-            )
+        elif busy and step_phase:
+            canvas.text(1, plan_row, f"%color(55,55,80) {step_phase} ")
 
     # ── Plan view overlay (i key) — anchored top-left ─────────────────────
     if show_plan_view and todo_items:
         ov_w = canvas.width  # full canvas width
-        inner_w = ov_w - 5  # text width between "│ " and " │"
+        inner_w = ov_w - 6  # text width between "│ " and " │"
         border = "%color(55,55,80)"
         done_c = "%color(70,160,100)"
         todo_c = "%color(160,160,160)"
@@ -2946,31 +3103,6 @@ def _notify_async(title: str, messages: List[dict]) -> None:
 # ═══════════════════════════════════════════════════════════════════════════════
 
 
-def _check_complexity_async(state: AppState, task: str) -> None:
-    """Non-blocking llama3.2 call to suggest plan mode."""
-
-    def _run() -> None:
-        try:
-            resp = ollama.chat(
-                model=_SMALL_MODEL,
-                messages=[
-                    {
-                        "role": "user",
-                        "content": f"Is this coding task complex enough to need a step-by-step plan?\nTask: {task}\nReply YES or NO only.",
-                    }
-                ],
-                stream=False,
-            )
-            if (resp.message.content or "").strip().upper().startswith("YES"):
-                with state.lock:
-                    if state.model_busy:
-                        state.plan_hint = True
-        except Exception:
-            pass
-
-    threading.Thread(target=_run, daemon=True).start()
-
-
 def main(argv: Tuple[str, ...]) -> None:
     if len(argv) < 2:
         print("Usage: python main.py <directory_path>")
@@ -3003,11 +3135,12 @@ def main(argv: Tuple[str, ...]) -> None:
 
     root = Path(argv[1]).resolve()
     state = AppState()
+    app = Application()
 
     tw = os.get_terminal_size().columns
     th = os.get_terminal_size().lines
     canvas = Canvas(tw, th - 8)
-    worker = AgentWorker(state, canvas, root)
+    worker = AgentWorker(state, canvas, root, app)
 
     tick = 0
     _SCROLL_STEP = 3
@@ -3112,24 +3245,14 @@ def main(argv: Tuple[str, ...]) -> None:
                                 0, state.scroll_offset - _SCROLL_STEP
                             )
 
-                # tab — toggle plan mode on/off persistently
-                elif key == "\t":
-                    with state.lock:
-                        state.plan_enabled = not state.plan_enabled
-                    continue
-
                 # Space — enter prompt mode
                 elif key == " ":
-                    use_plan = state.plan_enabled
                     _leave_cbreak()
-                    raw_input = (
-                        canvas.read_line("[PLAN] > " if use_plan else "> ") or ""
-                    )
+                    raw_input = canvas.read_line("> ") or ""
                     _enter_cbreak()
 
                     with state.lock:
                         state.scroll_offset = 0
-                        state.plan_hint = False
 
                     if "\x1b" in raw_input:
                         continue  # cancelled
@@ -3150,12 +3273,8 @@ def main(argv: Tuple[str, ...]) -> None:
                         state.think_duration = 0.0
 
                     system_prompt = generate_system_prompt(str(root), user_input)
-                    worker.start(
-                        messages_snapshot, system_prompt, user_input, plan_mode=use_plan
-                    )
+                    worker.start(messages_snapshot, system_prompt, user_input)
                     _start_think_labeller(state)
-                    if not use_plan:
-                        _check_complexity_async(state, user_input)
 
             time.sleep(0.016)
 
