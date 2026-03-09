@@ -330,8 +330,8 @@ class Canvas:
             pass
 
     def reset_console(self) -> None:
-        self._cache_buffer = Symbol.buffer(self.width, self.height)
-        self._frame_buffer = Symbol.buffer(self.width, self.height)
+        self._cache_buffer = Symbol.null_buffer(self.width, self.height)
+        self._frame_buffer = Symbol.null_buffer(self.width, self.height)
         sys.stdout.write("\u001b[0m\u001b[2J")
         sys.stdout.flush()
         self.show_cursor()
@@ -413,7 +413,7 @@ class Canvas:
                 if x >= self.width:
                     break
                 s = text_box.get(tb_x, tb_y)
-                if s.content != "\0" and s.content not in (" ", "\t"):
+                if s.content not in ("\0", "\t"):
                     self._frame_buffer[y][x] = s
 
     def draw(self) -> None:
@@ -601,9 +601,11 @@ _TOOLS: List[dict] = [
             "name": "read_file",
             "description": (
                 "Read a file in the project directory. "
-                "Without start_line/end_line returns up to 300 lines; if the file is longer "
-                "a truncation notice is appended — use start_line/end_line to read further sections. "
-                "Use search_file first to locate the relevant region in large files."
+                "Small files (≤ ~16k tokens / 64k chars) are returned in full with line numbers. "
+                "Large files are automatically split into parts and each part is condensed to "
+                "signatures, class/function names, and docstrings only — no implementation bodies. "
+                "Use start_line/end_line to read the exact content of any specific region, "
+                "or search_file to locate the relevant lines first."
             ),
             "parameters": {
                 "type": "object",
@@ -853,7 +855,333 @@ def _diff_stat(path: Optional[Path], before_lines: Optional[int], fn: str) -> st
     return ("  " + " ".join(parts)) if parts else ""
 
 
-_READ_LINE_LIMIT = 300  # max lines returned without explicit range
+_READ_LINE_LIMIT  = 300   # max lines returned without explicit range (legacy path)
+_READ_TOKEN_LIMIT = 16_000  # token budget for full-file reads  (~4 chars/token)
+_READ_CHAR_LIMIT  = _READ_TOKEN_LIMIT * 4   # 64 000 chars
+
+
+# ── Signature extractors (used when a file is too large for full read) ─────────
+
+def _extract_signatures_python(content: str) -> str:
+    """Return a header-file style skeleton for Python source."""
+    out: List[str] = []
+    lines = content.splitlines()
+    i = 0
+    while i < len(lines):
+        line = lines[i]
+        stripped = line.lstrip()
+
+        # Class definition
+        if stripped.startswith("class "):
+            out.append(line.rstrip())
+            # Grab the docstring if present
+            j = i + 1
+            while j < len(lines) and not lines[j].strip():
+                j += 1
+            if j < len(lines) and lines[j].strip().startswith(('"""', "'''")):
+                q = '"""' if lines[j].strip().startswith('"""') else "'''"
+                doc_line = lines[j].strip()[3:]
+                if q in doc_line:
+                    out.append("    " + lines[j].strip().split(q)[0] + q + "…\"\"\"")
+                else:
+                    out.append("    " + lines[j].strip())
+                    out.append("    …\"\"\"")
+            out.append("")
+            i += 1
+            continue
+
+        # Function / method definition (may span multiple lines)
+        if stripped.startswith(("def ", "async def ")):
+            sig_lines = [line.rstrip()]
+            while not sig_lines[-1].rstrip().endswith(":") and i + len(sig_lines) < len(lines):
+                sig_lines.append(lines[i + len(sig_lines)].rstrip())
+            out.extend(sig_lines)
+            # Grab the docstring
+            j = i + len(sig_lines)
+            while j < len(lines) and not lines[j].strip():
+                j += 1
+            # Indentation for the body stub: match the def line's indent + 4
+            body_indent = " " * (len(sig_lines[0]) - len(sig_lines[0].lstrip()) + 4)
+            if j < len(lines) and lines[j].strip().startswith(('"""', "'''")):
+                q = '"""' if lines[j].strip().startswith('"""') else "'''"
+                doc_line = lines[j].strip()[3:]
+                if q in doc_line:
+                    out.append(body_indent + doc_line.split(q)[0].strip())
+                else:
+                    # Multi-line docstring — grab first line
+                    out.append(body_indent + "# " + lines[j].strip()[3:])
+            out.append(body_indent + "...")
+            out.append("")
+            i += len(sig_lines)
+            continue
+
+        # Module-level constants / type aliases (not inside a block)
+        indent_depth = len(line) - len(stripped)
+        if indent_depth == 0 and stripped and not stripped.startswith("#"):
+            if "=" in stripped and not stripped.startswith(("if ", "for ", "while ", "with ")):
+                out.append(line.rstrip())
+                i += 1
+                continue
+
+        i += 1
+    return "\n".join(out)
+
+
+def _extract_signatures_c_style(content: str, ext: str) -> str:
+    """Return a header-file style skeleton for C / C++ / Java / C# / JS / TS."""
+    out: List[str] = []
+    # Match function/method definitions: optional modifiers + return type + name(…) {
+    fn_re = re.compile(
+        r"^[ \t]*"
+        r"(?:(?:public|private|protected|static|async|override|virtual|abstract|"
+        r"readonly|const|export|default|inline|extern|unsigned|signed|void|"
+        r"int|long|short|char|bool|float|double|string|auto|var|let|[\w<>\[\]*&]+)\s+)+"
+        r"[\w$][\w$]*\s*\([^)]*\)\s*(?::\s*[\w<>[\], ]+\s*)?\{?",
+        re.MULTILINE,
+    )
+    class_re = re.compile(
+        r"^[ \t]*(?:(?:public|private|protected|abstract|static|final|sealed)\s+)*"
+        r"(?:class|interface|struct|enum)\s+\w+",
+        re.MULTILINE,
+    )
+
+    lines = content.splitlines()
+    i = 0
+    brace_depth = 0
+    while i < len(lines):
+        line = lines[i]
+        stripped = line.strip()
+
+        # Track brace depth to detect top-level declarations
+        if class_re.match(line):
+            out.append(line.rstrip())
+            out.append("")
+        elif brace_depth == 0 and fn_re.match(line) and not stripped.startswith("//"):
+            out.append(line.rstrip())
+            # Grab inline comment or next-line doc comment as summary
+            if i + 1 < len(lines):
+                nxt = lines[i + 1].strip()
+                if nxt.startswith(("//", "*", "/*")):
+                    out.append("    " + nxt)
+            out.append("    { … }")
+            out.append("")
+
+        brace_depth += stripped.count("{") - stripped.count("}")
+        brace_depth = max(0, brace_depth)
+        i += 1
+
+    return "\n".join(out)
+
+
+def _extract_signatures_rust(content: str) -> str:
+    """Return a skeleton for Rust source: fn/pub fn, impl, struct, enum, trait."""
+    out: List[str] = []
+    lines = content.splitlines()
+    i = 0
+    # Collect doc-comment lines immediately above a declaration
+    pending_doc: List[str] = []
+    while i < len(lines):
+        line = lines[i]
+        stripped = line.strip()
+
+        # Doc comments (/// or //!)
+        if stripped.startswith("///") or stripped.startswith("//!"):
+            pending_doc.append(line.rstrip())
+            i += 1
+            continue
+
+        # Attributes (#[…])
+        if stripped.startswith("#["):
+            pending_doc.append(line.rstrip())
+            i += 1
+            continue
+
+        # impl / struct / enum / trait / type alias / const / static
+        if re.match(
+            r"^\s*(?:pub(?:\(.+\))?\s+)?(?:impl|struct|enum|trait|type|const|static)\b",
+            line,
+        ):
+            out.extend(pending_doc)
+            out.append(line.rstrip())
+            out.append("")
+            pending_doc = []
+            i += 1
+            continue
+
+        # fn / pub fn / async fn — may span multiple lines until the opening brace
+        if re.match(r"^\s*(?:pub(?:\(.+\))?\s+)?(?:async\s+)?fn\b", line):
+            sig = [line.rstrip()]
+            j = i + 1
+            while j < len(lines) and "{" not in sig[-1] and ";" not in sig[-1]:
+                sig.append(lines[j].rstrip())
+                j += 1
+            out.extend(pending_doc)
+            out.extend(sig)
+            out.append("    { … }")
+            out.append("")
+            pending_doc = []
+            i = j
+            continue
+
+        # Anything else clears the pending doc buffer
+        pending_doc = []
+        i += 1
+    return "\n".join(out)
+
+
+def _extract_signatures_zig(content: str) -> str:
+    """Return a skeleton for Zig source: pub fn / fn, struct, enum, union, const."""
+    out: List[str] = []
+    lines = content.splitlines()
+    i = 0
+    pending_doc: List[str] = []
+    while i < len(lines):
+        line = lines[i]
+        stripped = line.strip()
+
+        # Doc comments (/// or //)
+        if stripped.startswith("///") or stripped.startswith("//"):
+            pending_doc.append(line.rstrip())
+            i += 1
+            continue
+
+        # pub fn / fn
+        if re.match(r"^\s*(?:pub\s+)?fn\b", line):
+            sig = [line.rstrip()]
+            j = i + 1
+            # Collect continuation lines until opening brace
+            while j < len(lines) and "{" not in sig[-1]:
+                sig.append(lines[j].rstrip())
+                j += 1
+            out.extend(pending_doc)
+            out.extend(sig)
+            out.append("    // …")
+            out.append("}")
+            out.append("")
+            pending_doc = []
+            i = j
+            continue
+
+        # struct / enum / union / error set / comptime block
+        if re.match(r"^\s*(?:pub\s+)?(?:const\b.*=\s*(?:struct|enum|union)\b|comptime\b)", line):
+            out.extend(pending_doc)
+            out.append(line.rstrip())
+            out.append("    // …")
+            out.append("};")
+            out.append("")
+            pending_doc = []
+            i += 1
+            continue
+
+        # Top-level const / var declarations
+        if re.match(r"^\s*(?:pub\s+)?(?:const|var)\b", line):
+            out.extend(pending_doc)
+            out.append(line.rstrip())
+            out.append("")
+            pending_doc = []
+            i += 1
+            continue
+
+        pending_doc = []
+        i += 1
+    return "\n".join(out)
+
+
+def _extract_signatures_php(content: str) -> str:
+    """Return a skeleton for PHP source: function, class, interface, trait."""
+    out: List[str] = []
+    lines = content.splitlines()
+    i = 0
+    pending_doc: List[str] = []
+    while i < len(lines):
+        line = lines[i]
+        stripped = line.strip()
+
+        # PHPDoc blocks (/** … */)
+        if stripped.startswith("/**") or (pending_doc and stripped.startswith("*")):
+            pending_doc.append(line.rstrip())
+            if stripped.endswith("*/"):
+                # Keep only first summary line of docblock
+                summary = next(
+                    (l.strip().lstrip("* ") for l in pending_doc if l.strip().startswith("*") and not l.strip().startswith("/**") and not l.strip().startswith("* @") and l.strip() not in ("*/", "/**")),
+                    "",
+                )
+                pending_doc = ["    /** " + summary + " */"] if summary else []
+            i += 1
+            continue
+
+        # class / interface / trait / abstract class
+        if re.match(r"^\s*(?:abstract\s+)?(?:class|interface|trait)\b", line):
+            out.extend(pending_doc)
+            out.append(line.rstrip())
+            out.append("{")
+            out.append("    // …")
+            out.append("}")
+            out.append("")
+            pending_doc = []
+            i += 1
+            continue
+
+        # function declarations (standalone or methods)
+        if re.match(
+            r"^\s*(?:(?:public|protected|private|static|abstract|final|async)\s+)*function\b",
+            line,
+        ):
+            sig = [line.rstrip()]
+            j = i + 1
+            while j < len(lines) and "{" not in sig[-1] and ";" not in sig[-1]:
+                sig.append(lines[j].rstrip())
+                j += 1
+            out.extend(pending_doc)
+            out.extend(sig)
+            if "{" in sig[-1]:
+                out.append("    // …")
+                out.append("}")
+            out.append("")
+            pending_doc = []
+            i = j
+            continue
+
+        # Class constants / properties at class scope
+        if re.match(r"^\s*(?:public|protected|private|static|const)\s+", line):
+            out.extend(pending_doc)
+            out.append(line.rstrip())
+            out.append("")
+            pending_doc = []
+            i += 1
+            continue
+
+        pending_doc = []
+        i += 1
+    return "\n".join(out)
+
+
+def _extract_signatures_generic(content: str) -> str:
+    """Fallback: return first 50 lines + last 20 lines with a gap marker."""
+    lines = content.splitlines()
+    if len(lines) <= 80:
+        return content
+    head = lines[:50]
+    tail = lines[-20:]
+    mid  = f"\n… [{len(lines) - 70} lines omitted] …\n"
+    return "\n".join(head) + mid + "\n".join(tail)
+
+
+def _make_file_skeleton(content: str, ext: str) -> str:
+    """Convert oversized file content to a skeleton based on file type."""
+    ext = ext.lower().lstrip(".")
+    if ext == "py":
+        return _extract_signatures_python(content)
+    elif ext == "rs":
+        return _extract_signatures_rust(content)
+    elif ext == "zig":
+        return _extract_signatures_zig(content)
+    elif ext == "php":
+        return _extract_signatures_php(content)
+    elif ext in ("js", "ts", "jsx", "tsx", "java", "c", "cpp", "cs", "h", "hpp", "cc", "go", "kt", "swift"):
+        return _extract_signatures_c_style(content, ext)
+    else:
+        return _extract_signatures_generic(content)
 
 
 def _tool_read_file(
@@ -862,31 +1190,67 @@ def _tool_read_file(
     if not path.exists():
         return f"[ERROR] File not found: {rel}"
     try:
-        all_lines = path.read_text(encoding="utf-8").splitlines()
+        content = path.read_text(encoding="utf-8")
     except Exception as e:
         return f"[ERROR] {e}"
 
-    total = len(all_lines)
-    # Clamp to valid 1-based range
-    start = max(1, start_line)
-    if end_line is None:
-        end = start + _READ_LINE_LIMIT - 1
-    else:
-        end = end_line
-    end = min(end, total)
+    all_lines = content.splitlines()
+    total     = len(all_lines)
+    ext       = path.suffix
 
-    chunk = all_lines[start - 1 : end]
-    header = f"[FILE READ: {rel}  lines {start}-{end} of {total}  — this is a tool result, not user input]\n"
-    body = "\n".join(f"{start + i:>6}  {line}" for i, line in enumerate(chunk))
+    # ── Small file: fits in context — return whole thing ─────────────────────
+    if len(content) <= _READ_CHAR_LIMIT and start_line == 1 and end_line is None:
+        header = (
+            f"[FILE READ: {rel}  ({total} lines, {len(content)} chars) — "
+            "full file, this is a tool result not user input]\n"
+        )
+        body = "\n".join(f"{i + 1:>6}  {line}" for i, line in enumerate(all_lines))
+        return header + body + f"\n[END OF FILE: {rel}]"
 
-    footer = (
-        f"\n[END OF CHUNK — {total - end} more lines remain. "
-        f'To read the next section call read_file(path="{rel}", start_line={end + 1}). '
-        f"Your task has not changed — continue working on it.]"
-        if end < total
-        else f"\n[END OF FILE: {rel}]"
-    )
-    return header + body + footer
+    # ── Explicit range requested: legacy paged read ───────────────────────────
+    if start_line != 1 or end_line is not None:
+        start = max(1, start_line)
+        end   = min(end_line if end_line is not None else start + _READ_LINE_LIMIT - 1, total)
+        chunk = all_lines[start - 1 : end]
+        header = f"[FILE READ: {rel}  lines {start}-{end} of {total}  — this is a tool result, not user input]\n"
+        body   = "\n".join(f"{start + i:>6}  {line}" for i, line in enumerate(chunk))
+        footer = (
+            f"\n[END OF CHUNK — {total - end} more lines remain. "
+            f'To read the next section call read_file(path="{rel}", start_line={end + 1}). '
+            f"Your task has not changed — continue working on it.]"
+            if end < total
+            else f"\n[END OF FILE: {rel}]"
+        )
+        return header + body + footer
+
+    # ── Large file: split into parts and extract skeletons ───────────────────
+    chars     = len(content)
+    part_size = _READ_CHAR_LIMIT          # chars per chunk
+    n_parts   = (chars + part_size - 1) // part_size
+    parts: List[str] = [
+        content[i * part_size : (i + 1) * part_size]
+        for i in range(n_parts)
+    ]
+
+    out_parts: List[str] = [
+        f"[FILE READ: {rel}  ({total} lines, {chars} chars) — "
+        f"file is too large for a full read (~{chars // 4:,} tokens). "
+        f"Split into {n_parts} part(s); each part is summarised to signatures/docstrings only. "
+        f"Use search_file or read_file with start_line/end_line for the exact content of any section.]\n"
+    ]
+
+    for idx, part in enumerate(parts):
+        part_lines = content[:sum(len(p) for p in parts[:idx + 1])].count("\n")
+        skeleton   = _make_file_skeleton(part, ext)
+        out_parts.append(
+            f"\n{'─' * 60}\n"
+            f"PART {idx + 1}/{n_parts}\n"
+            f"{'─' * 60}\n"
+            + skeleton
+        )
+
+    out_parts.append(f"\n[END OF SKELETON: {rel}]")
+    return "\n".join(out_parts)
 
 
 def _tool_search_file(
@@ -1311,6 +1675,9 @@ class AgentWorker:
             self._state.replan_count = 0
 
         task = self._task
+        # history accumulates compressed step summaries — used only for
+        # step 6 goal check and step 7 summary.  It is NOT passed to the
+        # step executor; each step sees only its own context.
         history: List[dict] = list(messages)
         output_acc = ""
 
@@ -1321,27 +1688,27 @@ class AgentWorker:
             # ── Step 4: summarise request (temperature=0) ────────────────────
             task_summary = self._summarise_request(task)
 
-            all_tool_events: List[ToolEvent] = []
-            all_think_summaries: List[str] = []
+            # Accumulators carried across steps
+            all_tool_events: List[ToolEvent] = []   # every tool call so far
+            step_outputs:    List[str]        = []   # text output per completed step
+            # Maps file path → step index that last wrote it.
+            # Used to warn the executing model not to clobber prior work.
+            files_written:   Dict[str, int]   = {}
 
             _MAX_REPLANS = 2
             for replan_attempt in range(_MAX_REPLANS + 1):
                 if self._stopped():
                     break
 
-                # Populate UI todo list for this plan iteration
                 with self._state.lock:
                     self._state.todo_items = [TodoItem(text=s) for s in steps]
                     self._state.replan_count = replan_attempt
 
-                plan_complete = True
-
                 for step_idx, step_text in enumerate(steps):
                     if self._stopped():
-                        plan_complete = False
                         break
 
-                    # ── 5.1 Update UI ─────────────────────────────────────────
+                    # ── 5.1 / 5.2 / 5.3: attempt step, retry from 5.1 on fail ─
                     with self._state.lock:
                         self._state.step_phase = f"step {step_idx + 1}/{len(steps)}"
                         self._state.think_output = ""
@@ -1349,78 +1716,61 @@ class AgentWorker:
                         self._state.reply_started = False
                         self._state.tool_events = []
 
-                    history_len_before = len(history)
-
-                    # ── 5.2 / 5.3: Execute with retry on step-goal check ──────
-                    _MAX_STEP_RETRIES = 2
+                    _MAX_RETRIES = 2
                     step_ok = False
-                    think_acc = ""
+                    step_output = ""
+                    step_history: List[dict] = []  # always bound after the loop
 
-                    for retry in range(_MAX_STEP_RETRIES):
+                    for _retry in range(_MAX_RETRIES):
                         if self._stopped():
                             break
 
-                        context_block = self._build_step_context(
-                            task_summary, all_tool_events, all_think_summaries
-                        )
-                        completed_steps = [
-                            s for i, s in enumerate(steps) if i < step_idx
-                        ]
-                        upcoming_steps = [
-                            s for i, s in enumerate(steps) if i > step_idx
-                        ]
-
+                        # ── 5.1: build context ────────────────────────────────
+                        # Model receives ONLY: current task + past tool calls
+                        # + previous step outputs.  No raw user prompt, no thinking.
                         step_sys = self._build_step_system(
                             system_prompt,
-                            context_block,
                             step_text,
                             step_idx,
                             len(steps),
-                            completed_steps,
-                            upcoming_steps,
+                            all_tool_events,
+                            step_outputs,
+                            files_written,
                         )
 
-                        # ── 5.2 think + call tools ────────────────────────────
-                        think_acc = self._execute_step(
-                            step_text, history, step_sys, think_acc
+                        # Fresh history for each attempt — model never sees
+                        # its own prior thinking or the outer conversation.
+                        step_history: List[dict] = []
+
+                        # ── 5.2: think + call tools ───────────────────────────
+                        step_output, _think = self._execute_step(
+                            step_history, step_sys, step_text
                         )
 
-                        # ── 5.3 check step goal ───────────────────────────────
-                        step_ok = self._check_step_goal(step_text, history)
-
-                        # ── 5.4 log tool usage + thinking summary ─────────────
-                        with self._state.lock:
-                            step_events = list(self._state.tool_events)
-                        all_tool_events.extend(step_events)
-                        if think_acc.strip():
-                            all_think_summaries.append(
-                                self._compress_thinking(think_acc)
-                            )
-
+                        # ── 5.3: check step goal; loop back to 5.1 if not done
+                        step_ok = self._check_step_goal(step_text, step_history)
                         if step_ok:
                             break
+                        # retry: fresh step_history rebuilt at top of loop
 
-                        # Not yet achieved — nudge for retry
-                        if retry < _MAX_STEP_RETRIES - 1:
-                            history.append(
-                                {
-                                    "role": "user",
-                                    "content": (
-                                        f'The step "{step_text}" has not been fully '
-                                        "achieved. Please complete it now using the "
-                                        "appropriate tool call."
-                                    ),
-                                }
-                            )
-
-                    # ── 5.4 snapshot last-turn tools for UI ───────────────────
+                    # ── 5.4: log tool usage; store output for next step ───────
                     with self._state.lock:
                         last_tools = list(self._state.tool_events)
                         self._state.last_turn_tools = last_tools
                         self._state.tool_events = []
 
-                    # ── Context compression ───────────────────────────────────
-                    step_summary = self._summarise_step(step_text, history)
+                    all_tool_events.extend(last_tools)
+                    if step_output.strip():
+                        step_outputs.append(step_output.strip())
+
+                    # Record files written/created so later steps know not to clobber them
+                    writing_tools = {"write_file", "create_file"}
+                    for ev in last_tools:
+                        if ev.status == ToolStatus.DONE and ev.name in writing_tools:
+                            files_written[ev.label] = step_idx
+
+                    # Compress step into history for goal-check / summary context
+                    compressed = self._summarise_step(step_text, step_history)
                     mutating = {
                         "write_file",
                         "create_file",
@@ -1432,15 +1782,10 @@ class AgentWorker:
                         for ev in last_tools
                         if ev.status == ToolStatus.DONE and ev.name in mutating
                     ]
-                    compressed = (
-                        f"{step_summary}\nFiles changed: {', '.join(files_done)}"
-                        if files_done
-                        else step_summary
-                    )
-                    del history[history_len_before:]
-                    history.append({"role": "assistant", "content": compressed})
+                    if files_done:
+                        compressed += f"\nFiles changed: {', '.join(files_done)}"
 
-                    # Show step completion in chat
+                    history.append({"role": "assistant", "content": compressed})
                     with self._state.lock:
                         self._state.messages.append(
                             {"role": "assistant", "content": compressed}
@@ -1448,14 +1793,10 @@ class AgentWorker:
                         self._state.current_output = ""
                         self._state.reply_started = False
 
-                    # ── 5.5 tick step done ────────────────────────────────────
+                    # ── 5.5: advance ──────────────────────────────────────────
                     with self._state.lock:
                         if step_idx < len(self._state.todo_items):
                             self._state.todo_items[step_idx].done = True
-
-                    if not step_ok:
-                        plan_complete = False
-                        break
 
                 if self._stopped():
                     break
@@ -1469,14 +1810,29 @@ class AgentWorker:
                 if overall_ok:
                     break
 
-                if replan_attempt < _MAX_REPLANS:
-                    # Replan and restart
-                    with self._state.lock:
-                        self._state.step_phase = "replanning"
-                    prev_ctx = "\n".join(all_think_summaries[-4:])
-                    steps = self._make_plan(system_prompt, task, prior_context=prev_ctx)
-                    all_tool_events = []
-                    all_think_summaries = []
+                # Tell the user what happened
+                can_replan = replan_attempt < _MAX_REPLANS
+                fail_msg = (
+                    f"The overall goal was not fully achieved after {len(steps)} step(s). "
+                    + ("Replanning and retrying…" if can_replan else "Stopping.")
+                )
+                with self._state.lock:
+                    self._state.messages.append(
+                        {"role": "assistant", "content": fail_msg}
+                    )
+                history.append({"role": "assistant", "content": fail_msg})
+
+                if not can_replan:
+                    break
+
+                # Replan using previous outputs as context
+                with self._state.lock:
+                    self._state.step_phase = "replanning"
+                prev_ctx = "\n".join(step_outputs[-4:])
+                steps = self._make_plan(system_prompt, task, prior_context=prev_ctx)
+                all_tool_events = []
+                step_outputs    = []
+                files_written   = {}
 
             # ── Step 7: human-readable output summary ─────────────────────────
             with self._state.lock:
@@ -1518,26 +1874,89 @@ class AgentWorker:
             self._state.step_phase = "planning"
 
         extra = (
-            f"\n\nPrevious attempt context (use to improve the plan):\n{prior_context}"
-            if prior_context
-            else ""
+            f"\n\nPrevious attempt context:\n{prior_context}" if prior_context else ""
         )
         prompt = (
-            "You are a task planner for a coding agent.\n"
-            f"Overall task: {task}{extra}\n\n"
-            "Break this into sequential, atomic steps. Each step must:\n"
-            "— Be a single concrete action (write_file, create_file, or run_command).\n"
-            "— Name the exact file and describe exactly what it should contain.\n"
-            "— NOT include reading, searching, or planning sub-steps.\n"
+            "You are a PLANNER, not an implementer. Do not implement anything.\n"
+            "A separate agent will do the actual work — your only output is a list of steps.\n"
             "\n"
-            "Reply ONLY with a numbered list. No preamble, no commentary.\n\nSteps:"
+            f"Overall task: {task}{extra}\n\n"
+            "Produce a numbered list of steps the agent must execute IN ORDER.\n"
+            "\n"
+            "DECOMPOSITION RULES:\n"
+            "— Split the work into the SMALLEST possible steps where each step\n"
+            "  touches exactly ONE file or runs exactly ONE command.\n"
+            "— If a task involves multiple files, give each file its own step.\n"
+            "— If a task involves both writing and running, split them: one step\n"
+            "  to write, one step to run.\n"
+            "— Never bundle two separate concerns into one step.\n"
+            "\n"
+            "UNIQUENESS RULES:\n"
+            "— Every step must be UNIQUE. Do not repeat a step or rephrase the\n"
+            "  same action twice. Each file appears AT MOST ONCE as a creation\n"
+            "  target. Additions to an existing file count as edits, not creation.\n"
+            "— Do not create a file and then immediately 'update' it — decide its\n"
+            "  full contents once and write it in a single step.\n"
+            "— Before writing each step, check: have I already included this file\n"
+            "  or this action? If yes, merge or drop the duplicate.\n"
+            "\n"
+            "PRECISION RULES:\n"
+            "— Each step must be so precise that there is NOTHING left for the\n"
+            "  implementing agent to decide. If the agent could ask a clarifying\n"
+            "  question, the step is not precise enough.\n"
+            "— State the exact file path, the exact purpose of every section or\n"
+            "  function, and the exact behaviour expected — all in plain English.\n"
+            "— Do NOT leave implicit assumptions. If a file must have a title,\n"
+            "  state it. If a function returns a value, state what. If a command\n"
+            "  needs a flag, state the flag.\n"
+            "\n"
+            "FORMAT RULES:\n"
+            "— Do NOT write code, snippets, or file content inside a step.\n"
+            "— Do NOT use code fences (``` or `).\n"
+            "— Do NOT include reading, searching, or planning sub-steps.\n"
+            "— One tool call per step: write_file, create_file, or run_command.\n"
+            "\n"
+            "GOOD examples (atomic, unique, precise):\n"
+            "1. Create src/config.py with a Config dataclass containing three fields:\n"
+            "   host (str, default 'localhost'), port (int, default 8080), and\n"
+            "   debug (bool, default False).\n"
+            "2. Create src/server.py with a Server class whose constructor accepts\n"
+            "   a Config instance and stores it as self.config, and a start() method\n"
+            "   that prints 'Listening on host:port' using the config values.\n"
+            "3. Create tests/test_server.py with two pytest test functions: one that\n"
+            "   asserts Config() produces default field values, and one that asserts\n"
+            "   Server(Config()).start() prints the correct listening message.\n"
+            "4. Run pytest on tests/ with the -v flag.\n"
+            "\n"
+            "BAD examples (never do this):\n"
+            "1. Create config.py and server.py with the core logic.\n"
+            "   ↳ Bad: two files in one step.\n"
+            "2. Create README.md in the root directory.\n"
+            "   ↳ Bad: says nothing about what goes inside.\n"
+            "3. Update server.py to fix the imports.\n"
+            "   ↳ Bad: vague; also likely a duplicate if server.py was just created.\n"
+            "\n"
+            "Reply ONLY with the numbered list. No preamble, no code.\n\nSteps:"
         )
         try:
             resp = ollama.chat(
                 model=_MODEL,
-                messages=[{"role": "user", "content": prompt}],
+                messages=[
+                    {
+                        "role": "system",
+                        "content": (
+                            "You are a PLANNER. Your only job is to produce a numbered "
+                            "list of steps. You do NOT implement, write content, generate "
+                            "code, or produce any file contents whatsoever. "
+                            "You describe WHAT needs to be done, never HOW or WHAT the "
+                            "content should be. The actual implementation is done by a "
+                            "separate agent after you finish. Stay in planning mode only."
+                        ),
+                    },
+                    {"role": "user", "content": prompt},
+                ],
                 stream=False,
-                options={"temperature": 0.5},
+                options={"temperature": 0.3},
             )
             raw = re.sub(
                 r"<think>.*?</think>",
@@ -1546,16 +1965,65 @@ class AgentWorker:
                 flags=re.DOTALL,
             ).strip()
             steps: List[str] = []
+            in_fence = False
             for line in raw.splitlines():
-                m = re.match(
-                    r"^\s*(?:[Ss]tep\s*)?\d+[.):\-]\s+(.*)|^[-*]\s+(.*)",
-                    line.strip(),
+                if line.strip().startswith("```"):
+                    in_fence = not in_fence
+                    continue
+                if in_fence:
+                    continue
+
+                stripped = line.strip()
+                if not stripped:
+                    continue
+
+                # Numbered top-level step (e.g. "1. …" / "Step 2: …")
+                num_m = re.match(
+                    r"^\s*(?:[Ss]tep\s*)?\d+[.):\-]\s+(.*)",
+                    line,
                 )
-                if m:
-                    text = (m.group(1) or m.group(2) or "").strip()
+                if num_m:
+                    text = num_m.group(1).strip()
+                    text = re.sub(r"`[^`]*`", "", text).strip()
+                    text = re.sub(r"\s*:\s*```.*", "", text, flags=re.DOTALL).strip()
                     if text:
                         steps.append(text)
-            return steps if steps else [task]
+                    continue
+
+                # Bullet / dash / asterisk line — treat as continuation of the
+                # previous step, NOT a new step (the model often emits sub-bullets
+                # as part of a step description that the old code split into steps)
+                bullet_m = re.match(r"^\s*[-*•]\s+(.*)", line)
+                if bullet_m and steps:
+                    extra = bullet_m.group(1).strip()
+                    extra = re.sub(r"`[^`]*`", "", extra).strip()
+                    if extra:
+                        steps[-1] = steps[-1].rstrip(":").rstrip() + "; " + extra
+                    continue
+
+                # Indented continuation line (no bullet, no number) — also fold in
+                if line.startswith(("   ", "\t")) and steps and stripped:
+                    cleaned = re.sub(r"`[^`]*`", "", stripped).strip()
+                    if cleaned:
+                        steps[-1] = steps[-1].rstrip() + " " + cleaned
+
+            # ── Post-parse deduplication ──────────────────────────────────────
+            # Remove steps that are near-identical to an earlier step.
+            # Similarity: normalise to lowercase words, check overlap ratio.
+            def _word_set(s: str) -> set:
+                return set(re.findall(r"\w+", s.lower()))
+
+            deduped: List[str] = []
+            for step in steps:
+                ws = _word_set(step)
+                is_dup = any(
+                    len(ws & _word_set(prev)) / max(len(ws | _word_set(prev)), 1) > 0.75
+                    for prev in deduped
+                )
+                if not is_dup:
+                    deduped.append(step)
+
+            return deduped if deduped else [task]
         except Exception:
             return [task]
 
@@ -1591,114 +2059,287 @@ class AgentWorker:
         except Exception:
             return task[:100]
 
-    # ── Step 5.1: build context block ─────────────────────────────────────────
-
-    def _build_step_context(
-        self,
-        task_summary: str,
-        tool_events: List[ToolEvent],
-        think_summaries: List[str],
-    ) -> str:
-        """Assemble a compact context block for the current step's system prompt."""
-        parts = [f"Overall request: {task_summary}"]
-        if tool_events:
-            recent = tool_events[-10:]
-            lines = [
-                f"  {ev.status.name}: {ev.label}" + (f"  {ev.stat}" if ev.stat else "")
-                for ev in recent
-            ]
-            parts.append("Past tool calls:\n" + "\n".join(lines))
-        if think_summaries:
-            recent_s = think_summaries[-3:]
-            parts.append(
-                "Previous step summaries:\n" + "\n".join(f"  — {s}" for s in recent_s)
-            )
-        return "\n\n".join(parts)
+    # ── Step 5.1: build step system prompt ───────────────────────────────────
+    # Context = current task + past tool calls + previous step outputs.
+    # No user prompt, no raw thinking.
 
     def _build_step_system(
         self,
         base_sys: str,
-        context_block: str,
         step_text: str,
         step_idx: int,
         total_steps: int,
-        completed_steps: List[str],
-        upcoming_steps: List[str],
+        tool_events: List[ToolEvent],
+        step_outputs: List[str],
+        files_written: Dict[str, int],
     ) -> str:
-        """Build the system prompt for executing one step."""
-        done_block = (
-            "\n\nALREADY COMPLETED — do not redo:\n"
-            + "\n".join(f"  ✓ {s}" for s in completed_steps)
-            if completed_steps
+        """Build a clean system prompt for one step execution attempt."""
+        ctx_parts: List[str] = []
+
+        # ── Past tool calls ───────────────────────────────────────────────────
+        if tool_events:
+            recent = tool_events[-12:]
+            lines = [
+                f"  {ev.status.name}: {ev.label}"
+                + (f"  {ev.stat}" if ev.stat else "")
+                for ev in recent
+            ]
+            ctx_parts.append("PAST TOOL CALLS:\n" + "\n".join(lines))
+
+        # ── Previous step outputs ─────────────────────────────────────────────
+        if step_outputs:
+            recent_out = step_outputs[-4:]
+            ctx_parts.append(
+                "PREVIOUS STEP OUTPUTS:\n"
+                + "\n".join(
+                    f"  [{i + 1}] {o[:300]}" for i, o in enumerate(recent_out)
+                )
+            )
+
+        ctx_block = (
+            "\n\n════════════════════════════════════════\n"
+            "CONTEXT FROM PREVIOUS STEPS\n"
+            "════════════════════════════════════════\n"
+            + "\n\n".join(ctx_parts)
+            if ctx_parts
             else ""
         )
-        upcoming_block = (
-            "\n\nUPCOMING — do NOT start yet:\n"
-            + "\n".join(f"  → {s}" for s in upcoming_steps)
-            if upcoming_steps
-            else ""
+
+        # ── No-clobber guard ──────────────────────────────────────────────────
+        # Tell the model which files already exist from prior steps so it
+        # updates them instead of replacing them wholesale.
+        if files_written:
+            file_lines = "\n".join(
+                f"  • {path}  (written in step {idx + 1})"
+                for path, idx in sorted(files_written.items(), key=lambda x: x[1])
+            )
+            no_clobber = (
+                "\n\n════════════════════════════════════════\n"
+                "FILES WRITTEN BY PREVIOUS STEPS\n"
+                "════════════════════════════════════════\n"
+                + file_lines
+                + "\n\n"
+                "These files already contain work from earlier steps.\n"
+                "If this step needs to modify any of them:\n"
+                "  1. Call read_file first to get the current content.\n"
+                "  2. Call write_file with the COMPLETE updated content,\n"
+                "     preserving ALL existing content and only making the\n"
+                "     changes required by this step.\n"
+                "NEVER write one of these files from scratch — you will\n"
+                "destroy the work done by the previous steps."
+            )
+        else:
+            no_clobber = ""
+
+        # ── Permitted actions (derived from the step text) ────────────────────
+        allows_run, allowed_paths = self._extract_step_scope(step_text)
+        permit_lines: List[str] = []
+        if allowed_paths:
+            permit_lines.append(
+                "Files you may touch: " + ", ".join(allowed_paths)
+            )
+        if allows_run:
+            permit_lines.append("You may call run_command for this step.")
+        else:
+            permit_lines.append("You may NOT call run_command for this step.")
+        permitted_block = (
+            "\n\n════════════════════════════════════════\n"
+            "PERMITTED ACTIONS FOR THIS STEP\n"
+            "════════════════════════════════════════\n"
+            + "\n".join(permit_lines)
         )
+
         return (
             base_sys
             + "\n\n════════════════════════════════════════\n"
-            + f"CONTEXT\n{context_block}\n"
+            + f"CURRENT STEP ({step_idx + 1}/{total_steps})\n"
             + "════════════════════════════════════════\n"
-            + f"CURRENT STEP ({step_idx + 1}/{total_steps}) — do this and ONLY this:\n"
             + step_text
-            + done_block
-            + upcoming_block
-            + "\n\nUse write_file, create_file, run_command, or delete_file to complete "
-            "the step. When all required tool calls are done, write one short sentence "
-            "confirming what you did."
+            + ctx_block
+            + no_clobber
+            + permitted_block
+            + "\n\n════════════════════════════════════════\n"
+            "STRICT EXECUTION CONTRACT\n"
+            "════════════════════════════════════════\n"
+            "The step description above is your COMPLETE and EXHAUSTIVE specification.\n"
+            "You are only permitted to do what it explicitly states — nothing more.\n"
+            "\n"
+            "Before every tool call, ask yourself:\n"
+            "  'Is this call directly required by a specific sentence in the step?'\n"
+            "  If the answer is NO — do not make the call.\n"
+            "\n"
+            "You are FORBIDDEN from:\n"
+            "— Touching any file not listed under PERMITTED ACTIONS.\n"
+            "— Calling run_command unless PERMITTED ACTIONS says you may.\n"
+            "— Adding imports, helpers, or extras not described in the step.\n"
+            "— Running tests, linters, or checks unless the step explicitly says to.\n"
+            "— Fixing unrelated bugs or making improvements you noticed.\n"
+            "— Doing work that belongs to a different step.\n"
+            "\n"
+            "Stop the moment the step is complete. Write one sentence stating what you did."
         )
 
     # ── Step 5.2: execute step tool loop ─────────────────────────────────────
 
     def _execute_step(
         self,
-        step_text: str,
-        history: List[dict],
+        step_history: List[dict],  # fresh per attempt; modified in-place
         step_sys: str,
-        think_acc: str,
-    ) -> str:
-        """Run the tool-call loop for one step. Returns accumulated think text."""
-        _MAX_TURNS = 12
+        step_text: str,
+    ) -> Tuple[str, str]:
+        """Run the tool-call loop for one step attempt.
+
+        Returns (content_output, think_acc).
+        step_history is the isolated history for this attempt only —
+        no outer conversation, no prior thinking.
+
+        After every tool call the step goal is checked immediately so the
+        model cannot drift into over-achieving by continuing uninstructed.
+        Tool calls outside the step's declared scope are blocked before execution.
+        """
+        think_acc   = ""
+        content_out = ""
+        _MAX_TURNS  = 12
+        allows_run, allowed_paths = self._extract_step_scope(step_text)
+
         for _ in range(_MAX_TURNS):
             if self._stopped():
                 break
 
             content, think_chunk, tool_calls, asst_msg = self._stream_one_turn(
-                history,
+                step_history,
                 step_sys,
                 think_acc,
-                temperature=0.3,
+                temperature=0.15,
                 inject_plan=False,
                 tools=_PLAN_TOOLS,
             )
-            think_acc += think_chunk
-            history.append(asst_msg)
+            think_acc   += think_chunk
+            content_out  = content
+            step_history.append(asst_msg)
 
             if not tool_calls:
                 with self._state.lock:
                     self._state.current_output = ""
-                    self._state.reply_started = False
+                    self._state.reply_started  = False
                 break
 
             with self._state.lock:
-                self._state.reply_started = False
+                self._state.reply_started  = False
                 self._state.current_output = ""
 
-            think_acc = self._execute_tool_calls(tool_calls, history, think_acc)
-            for tool_call in tool_calls:
-                self._execute_tool(tool_call)
+            # ── Gate: block calls outside the step's declared scope ───────────
+            permitted: List[Any] = []
+            for tc in tool_calls:
+                fn   = tc.function.name
+                args = tc.function.arguments
+                if isinstance(args, str):
+                    try:
+                        args = json.loads(args)
+                    except Exception:
+                        args = {}
+                reason = self._gate_tool_call(fn, args, allows_run, allowed_paths)
+                if reason:
+                    # Inject a synthetic tool result so the model knows it was blocked
+                    step_history.append({
+                        "role":      "tool",
+                        "tool_name": fn,
+                        "content":   reason,
+                    })
+                else:
+                    permitted.append(tc)
 
-        return think_acc
+            if permitted:
+                think_acc = self._execute_tool_calls(permitted, step_history, think_acc)
+
+            # Check immediately after tool use — stop as soon as the step is
+            # satisfied rather than letting the model continue unnecessarily.
+            if self._check_step_goal(step_text, step_history):
+                break
+
+        return content_out, think_acc
+
+    def _extract_step_scope(self, step_text: str) -> Tuple[bool, List[str]]:
+        """Parse the step description to derive what the executor is permitted to do.
+
+        Returns:
+            allows_run   — True if the step explicitly involves running a command.
+            allowed_paths — list of file/directory paths mentioned in the step.
+        """
+        # run_command is allowed only when the step clearly intends it
+        run_keywords = re.compile(
+            r"\b(run|execute|invoke|call|start|launch|test|pytest|lint|build|install|"
+            r"compile|make|npm|pip|cargo|zig build|go run|docker|bash|sh)\b",
+            re.IGNORECASE,
+        )
+        allows_run = bool(run_keywords.search(step_text))
+
+        # Extract path-like tokens: things with slashes, dots-followed-by-ext,
+        # or quoted strings that look like file paths
+        path_re = re.compile(
+            r"(?:"
+            r"['\"]([^'\"]+\.[a-zA-Z0-9_]+)['\"]"   # quoted  'foo/bar.py'
+            r"|"
+            r"\b([\w./\\-]+\.[\w]{1,10})\b"           # bare    src/utils.py
+            r"|"
+            r"\b([\w-]+/[\w./\\-]+)\b"                # dir/    src/utils
+            r")"
+        )
+        paths: List[str] = []
+        for m in path_re.finditer(step_text):
+            p = m.group(1) or m.group(2) or m.group(3) or ""
+            p = p.strip("'\"/")
+            if p and ".." not in p:
+                paths.append(p)
+
+        # Deduplicate while preserving order
+        seen: set = set()
+        allowed_paths = [p for p in paths if not (p in seen or seen.add(p))]  # type: ignore[func-returns-value]
+        return allows_run, allowed_paths
+
+    def _gate_tool_call(
+        self,
+        fn: str,
+        args: dict,
+        allows_run: bool,
+        allowed_paths: List[str],
+    ) -> str:
+        """Return a block reason string if the call is out of scope, else empty string."""
+        # run_command is gated by whether the step mentions running something
+        if fn == "run_command" and not allows_run:
+            return (
+                "[BLOCKED] run_command is not permitted for this step. "
+                "The step description does not include running a command. "
+                "Complete the step using file operations only."
+            )
+
+        # File-mutating tools are gated by path, but only when the step explicitly
+        # names specific files.  If no paths could be extracted (the step is phrased
+        # in terms of behaviour rather than exact paths), we skip the check — the
+        # prompt instructions are the only guard in that case.
+        mutating = {"write_file", "create_file", "delete_file"}
+        if fn in mutating and allowed_paths:
+            target = args.get("path", "")
+            # Allow if the target matches any allowed path suffix
+            # (handles "src/foo.py" matching "foo.py" mention in the step)
+            matched = any(
+                target == p or target.endswith("/" + p) or p.endswith("/" + target)
+                for p in allowed_paths
+            )
+            if not matched:
+                return (
+                    f"[BLOCKED] {fn}({target!r}) is not permitted for this step. "
+                    f"The step only authorises: {', '.join(allowed_paths)}. "
+                    "Do not touch files that are not explicitly mentioned in the current step."
+                )
+
+        return ""
 
     # ── Step 5.3: check step goal ─────────────────────────────────────────────
 
-    def _check_step_goal(self, step_text: str, history: List[dict]) -> bool:
-        """Ask small model if step goal was achieved. YES/NO, temperature=0."""
-        recent = history[-6:]
+    def _check_step_goal(self, step_text: str, step_history: List[dict]) -> bool:
+        """Ask small model whether the step goal was achieved. YES/NO, temp=0."""
+        recent = step_history[-6:]
         ctx = "\n".join(
             f"{m['role']}: {str(m.get('content', ''))[:300]}" for m in recent
         )
@@ -1732,48 +2373,11 @@ class AgentWorker:
         except Exception:
             return True  # assume ok on model error
 
-    # ── Step 5.4: compress thinking for context carry-over ────────────────────
+    # ── Step 5.4 helper: one-line summary for history compression ────────────
 
-    def _compress_thinking(self, think_acc: str) -> str:
-        """Return a short summary of the thinking text for future step context."""
-        clean = re.sub(r"</?think>", "", think_acc).strip()
-        if not clean:
-            return ""
-        paras = [p.strip() for p in re.split(r"\n{2,}", clean) if p.strip()]
-        excerpt = "\n".join(paras[-3:])[:500]
-        try:
-            resp = ollama.chat(
-                model=_SMALL_MODEL,
-                messages=[
-                    {
-                        "role": "user",
-                        "content": (
-                            "Summarise this agent thinking in ONE sentence (max 20 words): "
-                            + excerpt
-                        ),
-                    }
-                ],
-                stream=False,
-                options={"temperature": 0, "num_predict": 30},
-            )
-            return (
-                re.sub(
-                    r"<think>.*?</think>",
-                    "",
-                    resp.message.content or "",
-                    flags=re.DOTALL,
-                )
-                .strip()
-                .split("\n")[0]
-            )
-        except Exception:
-            return excerpt[:80]
-
-    # ── Step 5 helper: summarise completed step for history compression ───────
-
-    def _summarise_step(self, step_text: str, history: List[dict]) -> str:
-        """One-line summary of what was accomplished for history compression."""
-        recent = history[-6:]
+    def _summarise_step(self, step_text: str, step_history: List[dict]) -> str:
+        """Compress what was done for a step into one sentence."""
+        recent = step_history[-6:]
         ctx = "\n".join(
             f"{m['role']}: {str(m.get('content', ''))[:300]}" for m in recent
         )
@@ -2014,6 +2618,54 @@ class AgentWorker:
         return content, thinking_chunk, unique, asst_msg
 
     # ── Private: tool execution ───────────────────────────────────────────────
+
+    def _execute_tool_calls(
+        self,
+        tool_calls: List[Any],
+        history: List[dict],
+        think_acc: str,
+    ) -> str:
+        """Execute a list of tool calls, append results to history, update UI.
+        Returns the updated think_acc string."""
+        for tc in tool_calls:
+            fn = tc.function.name
+            args = tc.function.arguments
+            if isinstance(args, str):
+                try:
+                    args = json.loads(args)
+                except Exception:
+                    args = {}
+
+            before_lines = self._snapshot_lines(fn, args)
+            event = self._push_tool_event(fn, args)
+
+            pending_sentinel = f"\x00TOOL_PENDING\x00{event.label}…"
+            think_acc += f"\n{pending_sentinel}"
+            with self._state.lock:
+                self._state.think_output = think_acc
+
+            result = self._execute_tool(fn, args)
+
+            stat = self._compute_stat(fn, args, before_lines)
+            self._resolve_tool_event(event, result, stat)
+            is_error = result.startswith("[ERROR]")
+            done_sentinel = (
+                f"\x00TOOL_ERROR\x00{event.label}"
+                if is_error
+                else f"\x00TOOL_DONE\x00{event.label}{stat}"
+            )
+            think_acc = think_acc.replace(pending_sentinel, done_sentinel) + "\n"
+            with self._state.lock:
+                self._state.think_output = think_acc
+
+            history.append(
+                {
+                    "role": "tool",
+                    "tool_name": fn,
+                    "content": result,
+                }
+            )
+        return think_acc
 
     def _execute_tool(self, name: str, args: dict) -> str:
         """Dispatch one tool call.  Path is resolved fresh per branch so that
@@ -2662,7 +3314,7 @@ def render_frame(canvas: Canvas, state: AppState, tick: int) -> None:
         step_phase = state.step_phase
         replan_count = state.replan_count
 
-    PLAN_ROWS = 1 if (todo_items or (busy and step_phase)) else 0
+    PLAN_ROWS = 1 if (todo_items or (busy and step_phase and step_phase != "planning")) else 0
     STATUS_ROW = H - 1 - PLAN_ROWS
 
     username = getpass.getuser()
@@ -2738,7 +3390,16 @@ def render_frame(canvas: Canvas, state: AppState, tick: int) -> None:
     if _has_think:
         think_display_lines = _parse_think_display_lines(think_text, W - 6)
         if think_mode == 2:  # expanded
-            think_rows_reserved = min(len(think_display_lines) + 1, H - 4)
+            if show_plan_view and todo_items:
+                # Plan overlay occupies rows 0..(len(items)+5) inclusive:
+                #   row 0          → top border  ╭─…─╮
+                #   rows 1..n+4    → _ov_row calls (PLAN, sep, items, sep, "i·close")
+                #   row n+5        → bottom border ╰─…─╯
+                plan_ov_last_row = len(todo_items) + 5
+                think_start_y    = plan_ov_last_row + 2
+                think_rows_reserved = max(2, STATUS_ROW - think_start_y)
+            else:
+                think_rows_reserved = min(len(think_display_lines) + 1, H - 4)
         elif think_mode == 1:  # collapsed (3 lines + header)
             content_rows = min(THINK_ROWS, len(think_display_lines))
             think_rows_reserved = content_rows + 1 if content_rows else 1
@@ -2766,9 +3427,10 @@ def render_frame(canvas: Canvas, state: AppState, tick: int) -> None:
     # ── Status bar ─────────────────────────────────────────────────────────
     if busy:
         spin = _SPINNER[(tick // 4) % len(_SPINNER)]
-        label = (
-            (think_label[0].upper() + think_label[1:]) if think_label else "Thinking…"
-        )
+        if step_phase == "planning":
+            label = "Planning…"
+        else:
+            label = (think_label[0].upper() + think_label[1:]) if think_label else "Thinking…"
         elapsed = f"({time.time() - think_start:.0f}s)" if think_start else ""
         left = f"{Theme.SPIN}{spin}%reset " + _shimmer_line(label, tick)
         if elapsed:
@@ -2779,7 +3441,7 @@ def render_frame(canvas: Canvas, state: AppState, tick: int) -> None:
         hint = "↑↓ scroll   ␣ type"
         canvas.text(max(0, (W - len(hint)) // 2), STATUS_ROW, Theme.HINT_SCROLL + hint)
     else:
-        hint = "↑↓ scroll   ␣ type   i view plan   o thinking"
+        hint = "↑↓ scroll   ␣ type"
         canvas.text(max(0, (W - len(hint)) // 2), STATUS_ROW, Theme.HINT + hint)
 
     # ── Plan strip ─────────────────────────────────────────────────────────
@@ -2793,17 +3455,21 @@ def render_frame(canvas: Canvas, state: AppState, tick: int) -> None:
             replan_tag = f" [replan {replan_count}]" if replan_count else ""
             phase_tag = f" · {step_phase}" if step_phase else ""
             plan_str = (
-                f"{done_count}/{total_count}{replan_tag}{phase_tag}  {active_text}"
+                f"{done_count}/{total_count}{replan_tag}{phase_tag}: {active_text}"
             )
-            if len(plan_str) > W - 4:
-                plan_str = plan_str[: W - 7] + "..."
-            canvas.text(1, plan_row, f"%color(80,80,80) {plan_str} ")
+            if len(plan_str) > canvas.width - 7:
+                plan_str = plan_str[: canvas.width - 8] + "…"
+
+            capped_len = min(len(plan_str), canvas.width - 6)
+
+            canvas.text(1, plan_row, f"%color(80,80,80)╰ {plan_str[:capped_len]} ")
         elif busy and step_phase:
-            canvas.text(1, plan_row, f"%color(55,55,80) {step_phase} ")
+            capped_len = min(len(step_phase), canvas.width - 6)
+            canvas.text(1, plan_row, f"%color(55,55,80)╰ {step_phase[:capped_len]} ")
 
     # ── Plan view overlay (i key) — anchored top-left ─────────────────────
     if show_plan_view and todo_items:
-        ov_w = canvas.width  # full canvas width
+        ov_w = canvas.width - 2  # full canvas width
         inner_w = ov_w - 6  # text width between "│ " and " │"
         border = "%color(55,55,80)"
         done_c = "%color(70,160,100)"
@@ -2816,16 +3482,16 @@ def render_frame(canvas: Canvas, state: AppState, tick: int) -> None:
         _ov_row_y = [1]  # mutable so the nested fn can increment it
 
         def _ov_row(text: str, colour: str = "%reset") -> None:
-            clipped = text[:inner_w] if len(text) > inner_w else text
+            clipped = text[:inner_w - 1] + "…" if len(text) > inner_w else text
             padded = clipped.ljust(inner_w)
             canvas.text(
-                0,
+                1,
                 _ov_row_y[0],
                 border + "│ " + colour + padded + "%reset" + border + " │",
             )
             _ov_row_y[0] += 1
 
-        canvas.text(0, 0, border + "╭" + "─" * (ov_w - 3) + "╮")
+        canvas.text(1, 0, border + "╭" + "─" * (ov_w - 4) + "╮")
         _ov_row("PLAN", head_c)
         _ov_row("─" * inner_w, sep_c)
         for idx, item in enumerate(todo_items, 1):
@@ -2953,16 +3619,11 @@ def _generate_tree(
     return built
 
 
-def generate_system_prompt(cwd: str, task: str = "") -> str:
+def generate_system_prompt(cwd: str) -> str:
     path = Path(cwd).resolve()
     patterns = _load_ignore_patterns(path)
     tree = _generate_tree(path, path, patterns)
 
-    task_block = (
-        task.strip()
-        if task.strip()
-        else "(not yet set — await the user's first message)"
-    )
     return f"""\
 You are a senior software engineer working inside a real project on the user's machine.
 You have direct access to the filesystem and shell. USE YOUR TOOLS — do not guess, read.
@@ -2978,21 +3639,15 @@ File tree:
 ```
 
 ════════════════════════════════════════
-CURRENT TASK
-════════════════════════════════════════
-{task_block}
-
-════════════════════════════════════════
 YOUR TOOLS
 ════════════════════════════════════════
 read_file(path, [start_line], [end_line])
-                              — Read a file. IMPORTANT: returns at most 300 lines.
-                                If the file is longer, the result ends with a notice:
-                                  [END OF CHUNK — N more lines remain. Call read_file
-                                   with start_line=X to read the next section.]
-                                This does NOT mean you have read the whole file.
-                                You MUST call read_file again with the given start_line
-                                until you see [END OF FILE: path].
+                              — Read a file.
+                                Small files (≤ ~16k tokens): returned in full with line numbers.
+                                Large files: automatically split and condensed to signatures,
+                                class/function names, and docstrings — no implementation bodies.
+                                Use start_line/end_line to read the exact bytes of any region,
+                                or search_file to locate the right lines first.
 summarise_file(path)          — Ask the model to read and summarise an entire file in
                                 one shot. Use when you need to understand a file without
                                 quoting or editing it. Cheaper on context than read_file.
@@ -3012,12 +3667,14 @@ consult_critic(plan)          — Adversarial review of your plan or code before
 HOW TO WORK (inside your thinking)
 ════════════════════════════════════════
 1. Understand the task in one sentence.
-2. read_file returns AT MOST 300 lines. If the result says [END OF CHUNK], you have NOT
-   read the full file — call read_file again with the indicated start_line. Keep going
-   until you see [END OF FILE]. Never assume you have the whole file from one call.
-   — To understand a file without editing it: use summarise_file instead.
-   — To find a specific function/class/line: use search_file (faster, less context).
-   — To read a large file in full for editing: paginate with read_file + start_line.
+2. read_file behaviour:
+   — Small files (≤ ~16k tokens): returned in full. No need to paginate.
+   — Large files: returned as a skeleton (signatures + docstrings only).
+     Use search_file to locate a specific region, then read_file with
+     start_line/end_line to get the exact implementation lines you need.
+   — To understand a large file without editing: use summarise_file.
+   — When you need to edit a large file, always read the relevant section
+     with start_line/end_line before writing — never guess at the content.
 3. For external information (APIs, error codes, versions), call web_search.
 4. Form a concrete plan. Then execute it immediately — do not describe it.
 5. For non-trivial code, call consult_critic before the final write.
@@ -3272,7 +3929,7 @@ def main(argv: Tuple[str, ...]) -> None:
                         state.current_output = ""
                         state.think_duration = 0.0
 
-                    system_prompt = generate_system_prompt(str(root), user_input)
+                    system_prompt = generate_system_prompt(str(root))
                     worker.start(messages_snapshot, system_prompt, user_input)
                     _start_think_labeller(state)
 
