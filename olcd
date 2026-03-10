@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """
 ollama-code  —  local AI coding agent, single-file.
 
@@ -586,6 +585,16 @@ class AppState:
 _MODEL = "qwen3:8b"
 _SMALL_MODEL = "llama3.2:latest"
 
+# Context window size for _MODEL.  Used by the context-full failsafe.
+_MODEL_CTX = 32_768
+
+# Step execution failsafe thresholds
+_FS_CTX_FULL_RATIO = 0.90  # FS1: restart if context >= 90 % full with no tools
+_FS_REPEAT_TOKENS = 2048  # FS2: sliding window size (words) for repetition check
+_FS_REPEAT_THRESHOLD = 0.66  # FS2: Jaccard overlap ratio that triggers restart
+_FS_THINK_CHECK_INTERVAL = 300  # FS3: seconds between reasoning-loop probes
+_FS_THINK_TIMEOUT = 1200  # FS4: seconds before thinking is considered stuck
+
 _TOOLS: List[dict] = [
     {
         "type": "function",
@@ -853,6 +862,7 @@ _READ_CHAR_LIMIT = 64_000
 
 # ── Signature extractors (used when a file is too large for full read) ─────────
 
+
 def _extract_signatures_python(content: str) -> str:
     """Return a header-file style skeleton for Python source."""
     out: List[str] = []
@@ -873,10 +883,10 @@ def _extract_signatures_python(content: str) -> str:
                 q = '"""' if lines[j].strip().startswith('"""') else "'''"
                 doc_line = lines[j].strip()[3:]
                 if q in doc_line:
-                    out.append("    " + lines[j].strip().split(q)[0] + q + "…\"\"\"")
+                    out.append("    " + lines[j].strip().split(q)[0] + q + '…"""')
                 else:
                     out.append("    " + lines[j].strip())
-                    out.append("    …\"\"\"")
+                    out.append('    …"""')
             out.append("")
             i += 1
             continue
@@ -884,7 +894,9 @@ def _extract_signatures_python(content: str) -> str:
         # Function / method definition (may span multiple lines)
         if stripped.startswith(("def ", "async def ")):
             sig_lines = [line.rstrip()]
-            while not sig_lines[-1].rstrip().endswith(":") and i + len(sig_lines) < len(lines):
+            while not sig_lines[-1].rstrip().endswith(":") and i + len(sig_lines) < len(
+                lines
+            ):
                 sig_lines.append(lines[i + len(sig_lines)].rstrip())
             out.extend(sig_lines)
             # Grab the docstring
@@ -909,7 +921,9 @@ def _extract_signatures_python(content: str) -> str:
         # Module-level constants / type aliases (not inside a block)
         indent_depth = len(line) - len(stripped)
         if indent_depth == 0 and stripped and not stripped.startswith("#"):
-            if "=" in stripped and not stripped.startswith(("if ", "for ", "while ", "with ")):
+            if "=" in stripped and not stripped.startswith(
+                ("if ", "for ", "while ", "with ")
+            ):
                 out.append(line.rstrip())
                 i += 1
                 continue
@@ -1054,7 +1068,9 @@ def _extract_signatures_zig(content: str) -> str:
             continue
 
         # struct / enum / union / error set / comptime block
-        if re.match(r"^\s*(?:pub\s+)?(?:const\b.*=\s*(?:struct|enum|union)\b|comptime\b)", line):
+        if re.match(
+            r"^\s*(?:pub\s+)?(?:const\b.*=\s*(?:struct|enum|union)\b|comptime\b)", line
+        ):
             out.extend(pending_doc)
             out.append(line.rstrip())
             out.append("    // …")
@@ -1094,7 +1110,14 @@ def _extract_signatures_php(content: str) -> str:
             if stripped.endswith("*/"):
                 # Keep only first summary line of docblock
                 summary = next(
-                    (l.strip().lstrip("* ") for l in pending_doc if l.strip().startswith("*") and not l.strip().startswith("/**") and not l.strip().startswith("* @") and l.strip() not in ("*/", "/**")),
+                    (
+                        l.strip().lstrip("* ")
+                        for l in pending_doc
+                        if l.strip().startswith("*")
+                        and not l.strip().startswith("/**")
+                        and not l.strip().startswith("* @")
+                        and l.strip() not in ("*/", "/**")
+                    ),
                     "",
                 )
                 pending_doc = ["    /** " + summary + " */"] if summary else []
@@ -1154,7 +1177,7 @@ def _extract_signatures_generic(content: str) -> str:
         return content
     head = lines[:50]
     tail = lines[-20:]
-    mid  = f"\n… [{len(lines) - 70} lines omitted] …\n"
+    mid = f"\n… [{len(lines) - 70} lines omitted] …\n"
     return "\n".join(head) + mid + "\n".join(tail)
 
 
@@ -1169,7 +1192,22 @@ def _make_file_skeleton(content: str, ext: str) -> str:
         return _extract_signatures_zig(content)
     elif ext == "php":
         return _extract_signatures_php(content)
-    elif ext in ("js", "ts", "jsx", "tsx", "java", "c", "cpp", "cs", "h", "hpp", "cc", "go", "kt", "swift"):
+    elif ext in (
+        "js",
+        "ts",
+        "jsx",
+        "tsx",
+        "java",
+        "c",
+        "cpp",
+        "cs",
+        "h",
+        "hpp",
+        "cc",
+        "go",
+        "kt",
+        "swift",
+    ):
         return _extract_signatures_c_style(content, ext)
     else:
         return _extract_signatures_generic(content)
@@ -1186,8 +1224,8 @@ def _tool_read_file(
         return f"[ERROR] {e}"
 
     all_lines = content.splitlines()
-    total     = len(all_lines)
-    ext       = path.suffix
+    total = len(all_lines)
+    ext = path.suffix
 
     # ── Small file: fits in context — return whole thing ─────────────────────
     if len(content) <= _READ_CHAR_LIMIT and start_line == 1 and end_line is None:
@@ -1201,10 +1239,12 @@ def _tool_read_file(
     # ── Explicit range requested: legacy paged read ───────────────────────────
     if start_line != 1 or end_line is not None:
         start = max(1, start_line)
-        end   = min(end_line if end_line is not None else start + _READ_LINE_LIMIT - 1, total)
+        end = min(
+            end_line if end_line is not None else start + _READ_LINE_LIMIT - 1, total
+        )
         chunk = all_lines[start - 1 : end]
         header = f"[FILE READ: {rel}  lines {start}-{end} of {total}  — this is a tool result, not user input]\n"
-        body   = "\n".join(f"{start + i:>6}  {line}" for i, line in enumerate(chunk))
+        body = "\n".join(f"{start + i:>6}  {line}" for i, line in enumerate(chunk))
         footer = (
             f"\n[END OF CHUNK — {total - end} more lines remain. "
             f'To read the next section call read_file(path="{rel}", start_line={end + 1}). '
@@ -1215,12 +1255,11 @@ def _tool_read_file(
         return header + body + footer
 
     # ── Large file: split into parts and extract skeletons ───────────────────
-    chars     = len(content)
-    part_size = _READ_CHAR_LIMIT          # chars per chunk
-    n_parts   = (chars + part_size - 1) // part_size
+    chars = len(content)
+    part_size = _READ_CHAR_LIMIT  # chars per chunk
+    n_parts = (chars + part_size - 1) // part_size
     parts: List[str] = [
-        content[i * part_size : (i + 1) * part_size]
-        for i in range(n_parts)
+        content[i * part_size : (i + 1) * part_size] for i in range(n_parts)
     ]
 
     out_parts: List[str] = [
@@ -1231,13 +1270,10 @@ def _tool_read_file(
     ]
 
     for idx, part in enumerate(parts):
-        part_lines = content[:sum(len(p) for p in parts[:idx + 1])].count("\n")
-        skeleton   = _make_file_skeleton(part, ext)
+        part_lines = content[: sum(len(p) for p in parts[: idx + 1])].count("\n")
+        skeleton = _make_file_skeleton(part, ext)
         out_parts.append(
-            f"\n{'─' * 60}\n"
-            f"PART {idx + 1}/{n_parts}\n"
-            f"{'─' * 60}\n"
-            + skeleton
+            f"\n{'─' * 60}\n" f"PART {idx + 1}/{n_parts}\n" f"{'─' * 60}\n" + skeleton
         )
 
     out_parts.append(f"\n[END OF SKELETON: {rel}]")
@@ -1583,6 +1619,41 @@ def _start_think_labeller(state: AppState) -> None:
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
+def _detect_repeating_reasoning(think_text: str) -> bool:
+    """Ask the small model whether the supplied thinking text is looping / repeating.
+
+    Returns True if repetition is detected, False otherwise (including on error).
+    Only the tail of the thinking text is examined to keep the prompt small.
+    """
+    excerpt = think_text[-3000:] if len(think_text) > 3000 else think_text
+    if not excerpt.strip():
+        return False
+    try:
+        resp = ollama.chat(
+            model=_SMALL_MODEL,
+            messages=[
+                {
+                    "role": "user",
+                    "content": (
+                        "Read the following reasoning excerpt and answer ONE word:\n"
+                        "Is the reasoning repeating the same ideas in circles without "
+                        "making progress?\n\n"
+                        f"EXCERPT:\n{excerpt}\n\n"
+                        "Answer YES or NO only."
+                    ),
+                }
+            ],
+            stream=False,
+            options={"temperature": 0, "num_predict": 5},
+        )
+        raw = re.sub(
+            r"<think>.*?</think>", "", resp.message.content or "", flags=re.DOTALL
+        ).strip()
+        return raw.upper().startswith("YES")
+    except Exception:
+        return False
+
+
 # § 7  AgentWorker  — 8-step structured pipeline
 # ═══════════════════════════════════════════════════════════════════════════════
 
@@ -1680,11 +1751,11 @@ class AgentWorker:
             task_summary = self._summarise_request(task)
 
             # Accumulators carried across steps
-            all_tool_events: List[ToolEvent] = []   # every tool call so far
-            step_outputs:    List[str]        = []   # text output per completed step
+            all_tool_events: List[ToolEvent] = []  # every tool call so far
+            step_outputs: List[str] = []  # text output per completed step
             # Maps file path → step index that last wrote it.
             # Used to warn the executing model not to clobber prior work.
-            files_written:   Dict[str, int]   = {}
+            files_written: Dict[str, int] = {}
 
             _MAX_REPLANS = 2
             for replan_attempt in range(_MAX_REPLANS + 1):
@@ -1742,7 +1813,9 @@ class AgentWorker:
                         # Skip the check if _execute_step already confirmed it —
                         # re-checking would wipe step_history and restart from scratch
                         # on a step the model already completed correctly.
-                        step_ok = goal_confirmed or self._check_step_goal(step_text, step_history)
+                        step_ok = goal_confirmed or self._check_step_goal(
+                            step_text, step_history
+                        )
                         if step_ok:
                             break
                         # retry: fresh step_history rebuilt at top of loop
@@ -1823,10 +1896,12 @@ class AgentWorker:
                 with self._state.lock:
                     self._state.step_phase = "replanning"
                 prev_ctx = "\n".join(step_outputs[-4:])
-                steps = self._make_validated_plan(system_prompt, task, prior_context=prev_ctx)
+                steps = self._make_validated_plan(
+                    system_prompt, task, prior_context=prev_ctx
+                )
                 all_tool_events = []
-                step_outputs    = []
-                files_written   = {}
+                step_outputs = []
+                files_written = {}
 
             # ── Step 7: human-readable output summary ─────────────────────────
             with self._state.lock:
@@ -1963,7 +2038,9 @@ class AgentWorker:
                     in_think = False
                     with self._state.lock:
                         self._state.think_output = think_acc
-                        self._state.think_duration = time.time() - self._state.think_start
+                        self._state.think_duration = (
+                            time.time() - self._state.think_start
+                        )
                     piece = after
                 if in_think:
                     think_acc += piece
@@ -2023,7 +2100,7 @@ class AgentWorker:
                 r"(?:def |class |import |from |return |raise |yield |async def "
                 r"|if __name__|#!|@\w+\()"
                 r"|(?:^\s*[\{\}\[\]]\s*$)"  # bare braces
-                r"|(?:=>|->|::\w)"           # arrow / scope syntax
+                r"|(?:=>|->|::\w)"  # arrow / scope syntax
                 r"|(?:^\s*\w+\s*=\s*(?:lambda|new |\[|\{))",  # assignment to lambda/collection
                 re.MULTILINE,
             )
@@ -2072,8 +2149,7 @@ class AgentWorker:
                 with self._state.lock:
                     self._state.step_phase = "replanning (bad plan)"
                 prior_context = (
-                    f"Previous plan was rejected: {reason}\n\n"
-                    + (prior_context or "")
+                    f"Previous plan was rejected: {reason}\n\n" + (prior_context or "")
                 ).strip()
         return steps
 
@@ -2175,8 +2251,7 @@ class AgentWorker:
         if tool_events:
             recent = tool_events[-12:]
             lines = [
-                f"  {ev.status.name}: {ev.label}"
-                + (f"  {ev.stat}" if ev.stat else "")
+                f"  {ev.status.name}: {ev.label}" + (f"  {ev.stat}" if ev.stat else "")
                 for ev in recent
             ]
             ctx_parts.append("PAST TOOL CALLS:\n" + "\n".join(lines))
@@ -2186,16 +2261,13 @@ class AgentWorker:
             recent_out = step_outputs[-4:]
             ctx_parts.append(
                 "PREVIOUS STEP OUTPUTS:\n"
-                + "\n".join(
-                    f"  [{i + 1}] {o[:300]}" for i, o in enumerate(recent_out)
-                )
+                + "\n".join(f"  [{i + 1}] {o[:300]}" for i, o in enumerate(recent_out))
             )
 
         ctx_block = (
             "\n\n════════════════════════════════════════\n"
             "CONTEXT FROM PREVIOUS STEPS\n"
-            "════════════════════════════════════════\n"
-            + "\n\n".join(ctx_parts)
+            "════════════════════════════════════════\n" + "\n\n".join(ctx_parts)
             if ctx_parts
             else ""
         )
@@ -2211,9 +2283,7 @@ class AgentWorker:
             no_clobber = (
                 "\n\n════════════════════════════════════════\n"
                 "FILES WRITTEN BY PREVIOUS STEPS\n"
-                "════════════════════════════════════════\n"
-                + file_lines
-                + "\n\n"
+                "════════════════════════════════════════\n" + file_lines + "\n\n"
                 "These files already contain work from earlier steps.\n"
                 "If this step needs to modify any of them:\n"
                 "  1. Call read_file first to get the current content.\n"
@@ -2230,9 +2300,7 @@ class AgentWorker:
         allows_run, allowed_paths = self._extract_step_scope(step_text)
         permit_lines: List[str] = []
         if allowed_paths:
-            permit_lines.append(
-                "Files you may touch: " + ", ".join(allowed_paths)
-            )
+            permit_lines.append("Files you may touch: " + ", ".join(allowed_paths))
         if allows_run:
             permit_lines.append("You may call run_command for this step.")
         else:
@@ -2240,8 +2308,7 @@ class AgentWorker:
         permitted_block = (
             "\n\n════════════════════════════════════════\n"
             "PERMITTED ACTIONS FOR THIS STEP\n"
-            "════════════════════════════════════════\n"
-            + "\n".join(permit_lines)
+            "════════════════════════════════════════\n" + "\n".join(permit_lines)
         )
 
         return (
@@ -2287,66 +2354,183 @@ class AgentWorker:
         Returns (content_output, think_acc, goal_confirmed).
         goal_confirmed is True when the goal check inside the loop already
         passed — the caller must not re-check or retry in that case.
+
+        Failsafes (all trigger a clean return with goal_confirmed=False so the
+        outer retry loop restarts the step from scratch):
+          FS1 — context window ≥ 90 % full with no tool calls → restart
+          FS2 — last 2048-word window overlaps ≥ 66 % with prior window → restart
+          FS3 — background thread asks llama3.2 every 300 s if thinking loops → restart
+          FS4 — thinking has been running > 1200 s → restart
         """
-        think_acc   = ""
+        think_acc = ""
         content_out = ""
         goal_confirmed = False
-        _MAX_TURNS  = 12
+        restart_reason = ""
+        _MAX_TURNS = 12
         allows_run, allowed_paths = self._extract_step_scope(step_text)
 
-        for _ in range(_MAX_TURNS):
-            if self._stopped():
-                break
+        # ── Failsafe monitor setup ────────────────────────────────────────────
+        # restart_flag is shared between _execute_step and the monitor thread.
+        # When any failsafe fires the monitor sets the flag, which is checked
+        # inside _stream_one_turn and also at the top of each tool-loop iteration.
+        restart_flag = threading.Event()
+        fs_stop = threading.Event()  # tells the monitor to exit cleanly
+        fs_reason_box: List[str] = [""]  # [0] written by monitor, read by main
 
-            content, think_chunk, tool_calls, asst_msg = self._stream_one_turn(
-                step_history,
-                step_sys,
-                think_acc,
-                temperature=0.15,
-                tools=_PLAN_TOOLS,
-            )
-            think_acc   += think_chunk
-            content_out  = content
-            step_history.append(asst_msg)
+        # Accumulated text (think + content) across all turns — used by FS2.
+        token_text_acc = ""
 
-            if not tool_calls:
+        def _monitor_thread() -> None:
+            last_fs3_check = time.time()
+            while not fs_stop.wait(timeout=2):
+                now = time.time()
+
+                # FS4: thinking timeout
                 with self._state.lock:
+                    ts = self._state.think_start
+                if ts and (now - ts) > _FS_THINK_TIMEOUT:
+                    fs_reason_box[0] = (
+                        f"FS4: thinking exceeded {_FS_THINK_TIMEOUT}s — restarting step"
+                    )
+                    restart_flag.set()
+                    return
+
+                # FS3: periodic reasoning-loop probe
+                if now - last_fs3_check >= _FS_THINK_CHECK_INTERVAL:
+                    last_fs3_check = now
+                    snapshot = (
+                        think_acc  # read without lock — worst case stale by one chunk
+                    )
+                    if snapshot and _detect_repeating_reasoning(snapshot):
+                        fs_reason_box[0] = (
+                            "FS3: repeating reasoning detected after "
+                            f"{_FS_THINK_CHECK_INTERVAL}s probe — restarting step"
+                        )
+                        restart_flag.set()
+                        return
+
+        monitor = threading.Thread(target=_monitor_thread, daemon=True)
+        monitor.start()
+
+        try:
+            for _ in range(_MAX_TURNS):
+                if self._stopped() or restart_flag.is_set():
+                    break
+
+                content, think_chunk, tool_calls, asst_msg, p_eval, gen_eval = (
+                    self._stream_one_turn(
+                        step_history,
+                        step_sys,
+                        think_acc,
+                        temperature=0.15,
+                        tools=_PLAN_TOOLS,
+                        restart_flag=restart_flag,
+                    )
+                )
+                think_acc += think_chunk
+                token_text_acc += think_chunk + " " + content
+                content_out = content
+                step_history.append(asst_msg)
+
+                # Check if the monitor flagged a restart mid-stream
+                if restart_flag.is_set():
+                    restart_reason = fs_reason_box[0] or "failsafe triggered mid-stream"
+                    break
+
+                if not tool_calls:
+                    with self._state.lock:
+                        self._state.current_output = ""
+                        self._state.reply_started = False
+
+                    # FS1: context window near-full with no tool execution
+                    total_tokens = p_eval + gen_eval
+                    if (
+                        total_tokens > 0
+                        and total_tokens >= _MODEL_CTX * _FS_CTX_FULL_RATIO
+                    ):
+                        restart_reason = (
+                            f"FS1: context window {total_tokens}/{_MODEL_CTX} tokens "
+                            f"({100 * total_tokens // _MODEL_CTX}% full) with no tool "
+                            "calls — restarting step"
+                        )
+                        break
+
+                    if self._check_step_goal(step_text, step_history):
+                        goal_confirmed = True
+                    break
+
+                with self._state.lock:
+                    self._state.reply_started = False
                     self._state.current_output = ""
-                    self._state.reply_started  = False
+
+                # ── Gate: block calls outside the step's declared scope ───────
+                permitted: List[Any] = []
+                for tc in tool_calls:
+                    fn = tc.function.name
+                    args = tc.function.arguments
+                    if isinstance(args, str):
+                        try:
+                            args = json.loads(args)
+                        except Exception:
+                            args = {}
+                    reason = self._gate_tool_call(fn, args, allows_run, allowed_paths)
+                    if reason:
+                        step_history.append(
+                            {
+                                "role": "tool",
+                                "tool_name": fn,
+                                "content": reason,
+                            }
+                        )
+                    else:
+                        permitted.append(tc)
+
+                if permitted:
+                    think_acc = self._execute_tool_calls(
+                        permitted, step_history, think_acc
+                    )
+
+                # FS2: sliding-window token repetition check
+                words = token_text_acc.split()
+                n = _FS_REPEAT_TOKENS
+                if len(words) >= n * 2:
+                    prev_window = set(words[-n * 2 : -n])
+                    last_window = set(words[-n:])
+                    union = prev_window | last_window
+                    if union:
+                        jaccard = len(prev_window & last_window) / len(union)
+                        if jaccard >= _FS_REPEAT_THRESHOLD:
+                            # Log the tool actions taken before restarting
+                            with self._state.lock:
+                                logged_events = list(self._state.tool_events)
+                            tool_summary = (
+                                "; ".join(
+                                    f"{ev.name}({ev.label})" for ev in logged_events
+                                )
+                                or "none"
+                            )
+                            restart_reason = (
+                                f"FS2: token repetition {jaccard:.0%} in last "
+                                f"{n * 2} words (threshold {_FS_REPEAT_THRESHOLD:.0%}); "
+                                f"tool actions this attempt: {tool_summary} — restarting step"
+                            )
+                            break
+
                 if self._check_step_goal(step_text, step_history):
                     goal_confirmed = True
-                break
+                    break
 
+        finally:
+            fs_stop.set()
+            monitor.join(timeout=1)
+
+        if restart_reason:
             with self._state.lock:
-                self._state.reply_started  = False
-                self._state.current_output = ""
-
-            # ── Gate: block calls outside the step's declared scope ───────────
-            permitted: List[Any] = []
-            for tc in tool_calls:
-                fn   = tc.function.name
-                args = tc.function.arguments
-                if isinstance(args, str):
-                    try:
-                        args = json.loads(args)
-                    except Exception:
-                        args = {}
-                reason = self._gate_tool_call(fn, args, allows_run, allowed_paths)
-                if reason:
-                    step_history.append({
-                        "role":      "tool",
-                        "tool_name": fn,
-                        "content":   reason,
-                    })
-                else:
-                    permitted.append(tc)
-
-            if permitted:
-                think_acc = self._execute_tool_calls(permitted, step_history, think_acc)
-
-            if self._check_step_goal(step_text, step_history):
-                goal_confirmed = True
-                break
+                self._state.think_output = (
+                    f"[FAILSAFE] {restart_reason}\n\n" + self._state.think_output
+                )
+            # Return goal_confirmed=False so the outer retry loop restarts the step
+            return content_out, think_acc, False
 
         mutating_tools = {"write_file", "create_file", "delete_file", "run_command"}
         with self._state.lock:
@@ -2378,11 +2562,11 @@ class AgentWorker:
         # or quoted strings that look like file paths
         path_re = re.compile(
             r"(?:"
-            r"['\"]([^'\"]+\.[a-zA-Z0-9_]+)['\"]"   # quoted  'foo/bar.py'
+            r"['\"]([^'\"]+\.[a-zA-Z0-9_]+)['\"]"  # quoted  'foo/bar.py'
             r"|"
-            r"\b([\w./\\-]+\.[\w]{1,10})\b"           # bare    src/utils.py
+            r"\b([\w./\\-]+\.[\w]{1,10})\b"  # bare    src/utils.py
             r"|"
-            r"\b([\w-]+/[\w./\\-]+)\b"                # dir/    src/utils
+            r"\b([\w-]+/[\w./\\-]+)\b"  # dir/    src/utils
             r")"
         )
         paths: List[str] = []
@@ -2580,21 +2764,30 @@ class AgentWorker:
         think_acc_so_far: str,
         temperature: Optional[float] = None,
         tools: Optional[List[dict]] = None,
-    ) -> Tuple[str, str, List[Any], dict]:
+        restart_flag: Optional[threading.Event] = None,
+    ) -> Tuple[str, str, List[Any], dict, int, int]:
         """
         Stream one ollama.chat call, parsing <think>...</think> tags manually.
         (think=True is not available in all SDK versions; tag parsing is reliable.)
+
+        Args:
+            restart_flag -- if set() by an external thread mid-stream, the stream
+                            loop breaks early (used by the step failsafe monitor).
 
         Returns:
             content          -- visible reply text accumulated this turn
             thinking_chunk   -- thinking text accumulated this turn
             tool_calls       -- deduplicated list of ToolCall objects (Ollama types)
             asst_msg         -- assembled assistant message dict for history
+            prompt_eval_count -- tokens in the prompt (from final done chunk; 0 if absent)
+            eval_count        -- tokens generated this turn (from final done chunk; 0 if absent)
         """
         thinking_chunk = ""
         content = ""
         tool_calls_raw: List[Any] = []
         in_think = False
+        prompt_eval_count = 0
+        eval_count = 0
 
         active_tools = tools if tools is not None else _TOOLS
         options = {"temperature": temperature} if temperature is not None else {}
@@ -2609,9 +2802,16 @@ class AgentWorker:
         for chunk in stream:
             if self._stopped():
                 break
+            if restart_flag is not None and restart_flag.is_set():
+                break
 
             msg = chunk.message
             piece = msg.content or ""
+
+            # Capture token counts from the final (done=True) chunk
+            if getattr(chunk, "done", False):
+                prompt_eval_count = getattr(chunk, "prompt_eval_count", 0) or 0
+                eval_count = getattr(chunk, "eval_count", 0) or 0
 
             if piece:
                 # ── <think> open ──────────────────────────────────────────────
@@ -2687,7 +2887,7 @@ class AgentWorker:
                 for tc in unique
             ]
 
-        return content, thinking_chunk, unique, asst_msg
+        return content, thinking_chunk, unique, asst_msg, prompt_eval_count, eval_count
 
     # ── Private: tool execution ───────────────────────────────────────────────
 
@@ -3386,7 +3586,9 @@ def render_frame(canvas: Canvas, state: AppState, tick: int) -> None:
         step_phase = state.step_phase
         replan_count = state.replan_count
 
-    PLAN_ROWS = 1 if (todo_items or (busy and step_phase and step_phase != "planning")) else 0
+    PLAN_ROWS = (
+        1 if (todo_items or (busy and step_phase and step_phase != "planning")) else 0
+    )
     STATUS_ROW = H - 1 - PLAN_ROWS
 
     username = getpass.getuser()
@@ -3468,7 +3670,7 @@ def render_frame(canvas: Canvas, state: AppState, tick: int) -> None:
                 #   rows 1..n+4    → _ov_row calls (PLAN, sep, items, sep, "i·close")
                 #   row n+5        → bottom border ╰─…─╯
                 plan_ov_last_row = len(todo_items) + 5
-                think_start_y    = plan_ov_last_row + 2
+                think_start_y = plan_ov_last_row + 2
                 think_rows_reserved = max(2, STATUS_ROW - think_start_y)
             else:
                 think_rows_reserved = min(len(think_display_lines) + 1, H - 4)
@@ -3502,7 +3704,11 @@ def render_frame(canvas: Canvas, state: AppState, tick: int) -> None:
         if step_phase == "planning":
             label = "Planning…"
         else:
-            label = (think_label[0].upper() + think_label[1:]) if think_label else "Thinking…"
+            label = (
+                (think_label[0].upper() + think_label[1:])
+                if think_label
+                else "Thinking…"
+            )
         elapsed = f"({time.time() - think_start:.0f}s)" if think_start else ""
         left = f"{Theme.SPIN}{spin}%reset " + _shimmer_line(label, tick)
         if elapsed:
@@ -3529,15 +3735,15 @@ def render_frame(canvas: Canvas, state: AppState, tick: int) -> None:
             plan_str = (
                 f"{done_count}/{total_count}{replan_tag}{phase_tag}: {active_text}"
             )
-            if len(plan_str) > canvas.width - 7:
-                plan_str = plan_str[: canvas.width - 8] + "…"
+            if len(plan_str) > canvas.width - 8:
+                plan_str = plan_str[: canvas.width - 9] + "…"
 
-            capped_len = min(len(plan_str), canvas.width - 6)
+            capped_len = min(len(plan_str), canvas.width - 7)
 
-            canvas.text(1, plan_row, f"%color(80,80,80)╰ {plan_str[:capped_len]} ")
+            canvas.text(1, plan_row, f"%color(80,80,80)╰─ {plan_str[:capped_len]} ")
         elif busy and step_phase:
             capped_len = min(len(step_phase), canvas.width - 6)
-            canvas.text(1, plan_row, f"%color(55,55,80)╰ {step_phase[:capped_len]} ")
+            canvas.text(1, plan_row, f"%color(55,55,80)╰─ {step_phase[:capped_len]} ")
 
     # ── Plan view overlay (i key) — anchored top-left ─────────────────────
     if show_plan_view and todo_items:
@@ -3554,7 +3760,7 @@ def render_frame(canvas: Canvas, state: AppState, tick: int) -> None:
         _ov_row_y = [1]  # mutable so the nested fn can increment it
 
         def _ov_row(text: str, colour: str = "%reset") -> None:
-            clipped = text[:inner_w - 1] + "…" if len(text) > inner_w else text
+            clipped = text[: inner_w - 1] + "…" if len(text) > inner_w else text
             padded = clipped.ljust(inner_w)
             canvas.text(
                 1,
@@ -3576,7 +3782,7 @@ def render_frame(canvas: Canvas, state: AppState, tick: int) -> None:
             _ov_row(f"[{mark}] {idx}. {item.text}", colour)
         _ov_row("─" * inner_w, sep_c)
         _ov_row("i · close", "%color(70,70,90)")
-        canvas.text(0, _ov_row_y[0], border + "╰" + "─" * (ov_w - 3) + "╯")
+        canvas.text(1, _ov_row_y[0], border + "╰" + "─" * (ov_w - 4) + "╯")
 
     # ── Think block ────────────────────────────────────────────────────────
     if _has_think:
@@ -3674,20 +3880,45 @@ def _is_ignored(path: Path, root: Path, patterns: List[str]) -> bool:
 def _generate_tree(
     path: Path, root: Path, patterns: List[str], prefix: str = ""
 ) -> str:
-    built = f"{prefix}{path.name}/\n"
+    # Root gets a special marker so the model can't mistake it for a subdirectory
+    if path == root:
+        label = f"[PROJECT ROOT]  {path.name}/"
+    else:
+        label = f"{prefix}{path.name}/"
+        prefix_for_children = prefix
+        items = [
+            i
+            for i in sorted(path.iterdir(), key=lambda x: (x.is_file(), x.name.lower()))
+            if not _is_ignored(i, root, patterns)
+        ]
+        built = label + "\n"
+        for idx, item in enumerate(items):
+            is_last = idx == len(items) - 1
+            pointer = "└── " if is_last else "├── "
+            if item.is_dir():
+                ext = "    " if is_last else "│   "
+                built += _generate_tree(
+                    item, root, patterns, prefix=prefix_for_children + ext
+                )
+            else:
+                built += f"{prefix_for_children}{pointer}{item.name}\n"
+        return built
+
+    # Root-level rendering
     items = [
         i
         for i in sorted(path.iterdir(), key=lambda x: (x.is_file(), x.name.lower()))
         if not _is_ignored(i, root, patterns)
     ]
+    built = label + "\n"
     for idx, item in enumerate(items):
         is_last = idx == len(items) - 1
         pointer = "└── " if is_last else "├── "
         if item.is_dir():
             ext = "    " if is_last else "│   "
-            built += _generate_tree(item, root, patterns, prefix=prefix + ext)
+            built += _generate_tree(item, root, patterns, prefix=ext)
         else:
-            built += f"{prefix}{pointer}{item.name}\n"
+            built += f"{pointer}{item.name}\n"
     return built
 
 
@@ -3701,11 +3932,12 @@ You are a senior software engineer working inside a real project on the user's m
 You have direct access to the filesystem and shell. USE YOUR TOOLS — do not guess, read.
 
 ════════════════════════════════════════
-PROJECT
+PROJECT ROOT  →  {path}
 ════════════════════════════════════════
-Working directory: {path}
+All relative paths are resolved from this directory.
+Every file you create or edit lives inside it.
 
-File tree:
+File tree (root marked [PROJECT ROOT]):
 ```
 {tree.rstrip()}
 ```
