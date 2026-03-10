@@ -310,12 +310,6 @@ class Canvas:
         sys.stdout.write("\u001b[?25h")
         sys.stdout.flush()
 
-    def toggle_cursor(self) -> None:
-        if self._is_cursor_hidden:
-            self.show_cursor()
-        else:
-            self.hide_cursor()
-
     def set_cursor_position(self, left: int, top: int) -> None:
         left, top = max(left, 0), max(top, 0)
         try:
@@ -335,9 +329,6 @@ class Canvas:
         sys.stdout.write("\u001b[0m\u001b[2J")
         sys.stdout.flush()
         self.show_cursor()
-
-    def clear(self) -> None:
-        self.resize(self.width, self.height)
 
     def resize(self, width: int = None, height: int = None) -> None:  # type: ignore[assignment]
         if width is None or height is None:
@@ -403,16 +394,16 @@ class Canvas:
                 continue
             self._frame_buffer[y][start_x + dx] = symbol
 
-    def text_box(self, start_x: int, start_y: int, text_box: TextBox) -> None:
-        for tb_y in range(text_box.height):
+    def text_box(self, start_x: int, start_y: int, box: TextBox) -> None:
+        for tb_y in range(box.height):
             y = start_y + tb_y
             if y >= self.height:
                 break
-            for tb_x in range(text_box.width):
+            for tb_x in range(box.width):
                 x = start_x + tb_x
                 if x >= self.width:
                     break
-                s = text_box.get(tb_x, tb_y)
+                s = box.get(tb_x, tb_y)
                 if s.content not in ("\0", "\t"):
                     self._frame_buffer[y][x] = s
 
@@ -855,12 +846,12 @@ def _diff_stat(path: Optional[Path], before_lines: Optional[int], fn: str) -> st
     return ("  " + " ".join(parts)) if parts else ""
 
 
-_READ_LINE_LIMIT  = 300   # max lines returned without explicit range (legacy path)
-_READ_TOKEN_LIMIT = 16_000  # token budget for full-file reads  (~4 chars/token)
-_READ_CHAR_LIMIT  = _READ_TOKEN_LIMIT * 4   # 64 000 chars
+_READ_LINE_LIMIT = 300
+_READ_CHAR_LIMIT = 64_000
 
 
 # ── Signature extractors (used when a file is too large for full read) ─────────
+
 
 def _extract_signatures_python(content: str) -> str:
     """Return a header-file style skeleton for Python source."""
@@ -882,10 +873,10 @@ def _extract_signatures_python(content: str) -> str:
                 q = '"""' if lines[j].strip().startswith('"""') else "'''"
                 doc_line = lines[j].strip()[3:]
                 if q in doc_line:
-                    out.append("    " + lines[j].strip().split(q)[0] + q + "…\"\"\"")
+                    out.append("    " + lines[j].strip().split(q)[0] + q + '…"""')
                 else:
                     out.append("    " + lines[j].strip())
-                    out.append("    …\"\"\"")
+                    out.append('    …"""')
             out.append("")
             i += 1
             continue
@@ -893,7 +884,9 @@ def _extract_signatures_python(content: str) -> str:
         # Function / method definition (may span multiple lines)
         if stripped.startswith(("def ", "async def ")):
             sig_lines = [line.rstrip()]
-            while not sig_lines[-1].rstrip().endswith(":") and i + len(sig_lines) < len(lines):
+            while not sig_lines[-1].rstrip().endswith(":") and i + len(sig_lines) < len(
+                lines
+            ):
                 sig_lines.append(lines[i + len(sig_lines)].rstrip())
             out.extend(sig_lines)
             # Grab the docstring
@@ -918,7 +911,9 @@ def _extract_signatures_python(content: str) -> str:
         # Module-level constants / type aliases (not inside a block)
         indent_depth = len(line) - len(stripped)
         if indent_depth == 0 and stripped and not stripped.startswith("#"):
-            if "=" in stripped and not stripped.startswith(("if ", "for ", "while ", "with ")):
+            if "=" in stripped and not stripped.startswith(
+                ("if ", "for ", "while ", "with ")
+            ):
                 out.append(line.rstrip())
                 i += 1
                 continue
@@ -1063,7 +1058,9 @@ def _extract_signatures_zig(content: str) -> str:
             continue
 
         # struct / enum / union / error set / comptime block
-        if re.match(r"^\s*(?:pub\s+)?(?:const\b.*=\s*(?:struct|enum|union)\b|comptime\b)", line):
+        if re.match(
+            r"^\s*(?:pub\s+)?(?:const\b.*=\s*(?:struct|enum|union)\b|comptime\b)", line
+        ):
             out.extend(pending_doc)
             out.append(line.rstrip())
             out.append("    // …")
@@ -1103,7 +1100,14 @@ def _extract_signatures_php(content: str) -> str:
             if stripped.endswith("*/"):
                 # Keep only first summary line of docblock
                 summary = next(
-                    (l.strip().lstrip("* ") for l in pending_doc if l.strip().startswith("*") and not l.strip().startswith("/**") and not l.strip().startswith("* @") and l.strip() not in ("*/", "/**")),
+                    (
+                        l.strip().lstrip("* ")
+                        for l in pending_doc
+                        if l.strip().startswith("*")
+                        and not l.strip().startswith("/**")
+                        and not l.strip().startswith("* @")
+                        and l.strip() not in ("*/", "/**")
+                    ),
                     "",
                 )
                 pending_doc = ["    /** " + summary + " */"] if summary else []
@@ -1163,7 +1167,7 @@ def _extract_signatures_generic(content: str) -> str:
         return content
     head = lines[:50]
     tail = lines[-20:]
-    mid  = f"\n… [{len(lines) - 70} lines omitted] …\n"
+    mid = f"\n… [{len(lines) - 70} lines omitted] …\n"
     return "\n".join(head) + mid + "\n".join(tail)
 
 
@@ -1178,7 +1182,22 @@ def _make_file_skeleton(content: str, ext: str) -> str:
         return _extract_signatures_zig(content)
     elif ext == "php":
         return _extract_signatures_php(content)
-    elif ext in ("js", "ts", "jsx", "tsx", "java", "c", "cpp", "cs", "h", "hpp", "cc", "go", "kt", "swift"):
+    elif ext in (
+        "js",
+        "ts",
+        "jsx",
+        "tsx",
+        "java",
+        "c",
+        "cpp",
+        "cs",
+        "h",
+        "hpp",
+        "cc",
+        "go",
+        "kt",
+        "swift",
+    ):
         return _extract_signatures_c_style(content, ext)
     else:
         return _extract_signatures_generic(content)
@@ -1195,8 +1214,8 @@ def _tool_read_file(
         return f"[ERROR] {e}"
 
     all_lines = content.splitlines()
-    total     = len(all_lines)
-    ext       = path.suffix
+    total = len(all_lines)
+    ext = path.suffix
 
     # ── Small file: fits in context — return whole thing ─────────────────────
     if len(content) <= _READ_CHAR_LIMIT and start_line == 1 and end_line is None:
@@ -1210,10 +1229,12 @@ def _tool_read_file(
     # ── Explicit range requested: legacy paged read ───────────────────────────
     if start_line != 1 or end_line is not None:
         start = max(1, start_line)
-        end   = min(end_line if end_line is not None else start + _READ_LINE_LIMIT - 1, total)
+        end = min(
+            end_line if end_line is not None else start + _READ_LINE_LIMIT - 1, total
+        )
         chunk = all_lines[start - 1 : end]
         header = f"[FILE READ: {rel}  lines {start}-{end} of {total}  — this is a tool result, not user input]\n"
-        body   = "\n".join(f"{start + i:>6}  {line}" for i, line in enumerate(chunk))
+        body = "\n".join(f"{start + i:>6}  {line}" for i, line in enumerate(chunk))
         footer = (
             f"\n[END OF CHUNK — {total - end} more lines remain. "
             f'To read the next section call read_file(path="{rel}", start_line={end + 1}). '
@@ -1224,12 +1245,11 @@ def _tool_read_file(
         return header + body + footer
 
     # ── Large file: split into parts and extract skeletons ───────────────────
-    chars     = len(content)
-    part_size = _READ_CHAR_LIMIT          # chars per chunk
-    n_parts   = (chars + part_size - 1) // part_size
+    chars = len(content)
+    part_size = _READ_CHAR_LIMIT  # chars per chunk
+    n_parts = (chars + part_size - 1) // part_size
     parts: List[str] = [
-        content[i * part_size : (i + 1) * part_size]
-        for i in range(n_parts)
+        content[i * part_size : (i + 1) * part_size] for i in range(n_parts)
     ]
 
     out_parts: List[str] = [
@@ -1240,13 +1260,10 @@ def _tool_read_file(
     ]
 
     for idx, part in enumerate(parts):
-        part_lines = content[:sum(len(p) for p in parts[:idx + 1])].count("\n")
-        skeleton   = _make_file_skeleton(part, ext)
+        part_lines = content[: sum(len(p) for p in parts[: idx + 1])].count("\n")
+        skeleton = _make_file_skeleton(part, ext)
         out_parts.append(
-            f"\n{'─' * 60}\n"
-            f"PART {idx + 1}/{n_parts}\n"
-            f"{'─' * 60}\n"
-            + skeleton
+            f"\n{'─' * 60}\n" f"PART {idx + 1}/{n_parts}\n" f"{'─' * 60}\n" + skeleton
         )
 
     out_parts.append(f"\n[END OF SKELETON: {rel}]")
@@ -1689,11 +1706,11 @@ class AgentWorker:
             task_summary = self._summarise_request(task)
 
             # Accumulators carried across steps
-            all_tool_events: List[ToolEvent] = []   # every tool call so far
-            step_outputs:    List[str]        = []   # text output per completed step
+            all_tool_events: List[ToolEvent] = []  # every tool call so far
+            step_outputs: List[str] = []  # text output per completed step
             # Maps file path → step index that last wrote it.
             # Used to warn the executing model not to clobber prior work.
-            files_written:   Dict[str, int]   = {}
+            files_written: Dict[str, int] = {}
 
             _MAX_REPLANS = 2
             for replan_attempt in range(_MAX_REPLANS + 1):
@@ -1743,12 +1760,17 @@ class AgentWorker:
                         step_history: List[dict] = []
 
                         # ── 5.2: think + call tools ───────────────────────────
-                        step_output, _think = self._execute_step(
+                        step_output, _think, goal_confirmed = self._execute_step(
                             step_history, step_sys, step_text
                         )
 
                         # ── 5.3: check step goal; loop back to 5.1 if not done
-                        step_ok = self._check_step_goal(step_text, step_history)
+                        # Skip the check if _execute_step already confirmed it —
+                        # re-checking would wipe step_history and restart from scratch
+                        # on a step the model already completed correctly.
+                        step_ok = goal_confirmed or self._check_step_goal(
+                            step_text, step_history
+                        )
                         if step_ok:
                             break
                         # retry: fresh step_history rebuilt at top of loop
@@ -1831,8 +1853,8 @@ class AgentWorker:
                 prev_ctx = "\n".join(step_outputs[-4:])
                 steps = self._make_plan(system_prompt, task, prior_context=prev_ctx)
                 all_tool_events = []
-                step_outputs    = []
-                files_written   = {}
+                step_outputs = []
+                files_written = {}
 
             # ── Step 7: human-readable output summary ─────────────────────────
             with self._state.lock:
@@ -1939,7 +1961,7 @@ class AgentWorker:
             "Reply ONLY with the numbered list. No preamble, no code.\n\nSteps:"
         )
         try:
-            resp = ollama.chat(
+            stream = ollama.chat(
                 model=_MODEL,
                 messages=[
                     {
@@ -1955,15 +1977,40 @@ class AgentWorker:
                     },
                     {"role": "user", "content": prompt},
                 ],
-                stream=False,
+                stream=True,
                 options={"temperature": 0.3},
             )
-            raw = re.sub(
-                r"<think>.*?</think>",
-                "",
-                resp.message.content or "",
-                flags=re.DOTALL,
-            ).strip()
+            raw_content = ""
+            think_acc = ""
+            in_think = False
+            with self._state.lock:
+                self._state.think_start = time.time()
+            for chunk in stream:
+                if self._stopped():
+                    break
+                piece = chunk.message.content or ""
+                if not piece:
+                    continue
+                if not in_think and "<think>" in piece:
+                    in_think = True
+                    piece = piece.split("<think>", 1)[1]
+                if in_think and "</think>" in piece:
+                    before, _, after = piece.partition("</think>")
+                    think_acc += before
+                    in_think = False
+                    with self._state.lock:
+                        self._state.think_output = think_acc
+                        self._state.think_duration = (
+                            time.time() - self._state.think_start
+                        )
+                    piece = after
+                if in_think:
+                    think_acc += piece
+                    with self._state.lock:
+                        self._state.think_output = think_acc
+                else:
+                    raw_content += piece
+            raw = raw_content.strip()
             steps: List[str] = []
             in_fence = False
             for line in raw.splitlines():
@@ -2080,8 +2127,7 @@ class AgentWorker:
         if tool_events:
             recent = tool_events[-12:]
             lines = [
-                f"  {ev.status.name}: {ev.label}"
-                + (f"  {ev.stat}" if ev.stat else "")
+                f"  {ev.status.name}: {ev.label}" + (f"  {ev.stat}" if ev.stat else "")
                 for ev in recent
             ]
             ctx_parts.append("PAST TOOL CALLS:\n" + "\n".join(lines))
@@ -2091,16 +2137,13 @@ class AgentWorker:
             recent_out = step_outputs[-4:]
             ctx_parts.append(
                 "PREVIOUS STEP OUTPUTS:\n"
-                + "\n".join(
-                    f"  [{i + 1}] {o[:300]}" for i, o in enumerate(recent_out)
-                )
+                + "\n".join(f"  [{i + 1}] {o[:300]}" for i, o in enumerate(recent_out))
             )
 
         ctx_block = (
             "\n\n════════════════════════════════════════\n"
             "CONTEXT FROM PREVIOUS STEPS\n"
-            "════════════════════════════════════════\n"
-            + "\n\n".join(ctx_parts)
+            "════════════════════════════════════════\n" + "\n\n".join(ctx_parts)
             if ctx_parts
             else ""
         )
@@ -2116,9 +2159,7 @@ class AgentWorker:
             no_clobber = (
                 "\n\n════════════════════════════════════════\n"
                 "FILES WRITTEN BY PREVIOUS STEPS\n"
-                "════════════════════════════════════════\n"
-                + file_lines
-                + "\n\n"
+                "════════════════════════════════════════\n" + file_lines + "\n\n"
                 "These files already contain work from earlier steps.\n"
                 "If this step needs to modify any of them:\n"
                 "  1. Call read_file first to get the current content.\n"
@@ -2135,9 +2176,7 @@ class AgentWorker:
         allows_run, allowed_paths = self._extract_step_scope(step_text)
         permit_lines: List[str] = []
         if allowed_paths:
-            permit_lines.append(
-                "Files you may touch: " + ", ".join(allowed_paths)
-            )
+            permit_lines.append("Files you may touch: " + ", ".join(allowed_paths))
         if allows_run:
             permit_lines.append("You may call run_command for this step.")
         else:
@@ -2145,8 +2184,7 @@ class AgentWorker:
         permitted_block = (
             "\n\n════════════════════════════════════════\n"
             "PERMITTED ACTIONS FOR THIS STEP\n"
-            "════════════════════════════════════════\n"
-            + "\n".join(permit_lines)
+            "════════════════════════════════════════\n" + "\n".join(permit_lines)
         )
 
         return (
@@ -2186,20 +2224,17 @@ class AgentWorker:
         step_history: List[dict],  # fresh per attempt; modified in-place
         step_sys: str,
         step_text: str,
-    ) -> Tuple[str, str]:
+    ) -> Tuple[str, str, bool]:
         """Run the tool-call loop for one step attempt.
 
-        Returns (content_output, think_acc).
-        step_history is the isolated history for this attempt only —
-        no outer conversation, no prior thinking.
-
-        After every tool call the step goal is checked immediately so the
-        model cannot drift into over-achieving by continuing uninstructed.
-        Tool calls outside the step's declared scope are blocked before execution.
+        Returns (content_output, think_acc, goal_confirmed).
+        goal_confirmed is True when the goal check inside the loop already
+        passed — the caller must not re-check or retry in that case.
         """
-        think_acc   = ""
+        think_acc = ""
         content_out = ""
-        _MAX_TURNS  = 12
+        goal_confirmed = False
+        _MAX_TURNS = 12
         allows_run, allowed_paths = self._extract_step_scope(step_text)
 
         for _ in range(_MAX_TURNS):
@@ -2211,27 +2246,26 @@ class AgentWorker:
                 step_sys,
                 think_acc,
                 temperature=0.15,
-                inject_plan=False,
                 tools=_PLAN_TOOLS,
             )
-            think_acc   += think_chunk
-            content_out  = content
+            think_acc += think_chunk
+            content_out = content
             step_history.append(asst_msg)
 
             if not tool_calls:
                 with self._state.lock:
                     self._state.current_output = ""
-                    self._state.reply_started  = False
+                    self._state.reply_started = False
                 break
 
             with self._state.lock:
-                self._state.reply_started  = False
+                self._state.reply_started = False
                 self._state.current_output = ""
 
             # ── Gate: block calls outside the step's declared scope ───────────
             permitted: List[Any] = []
             for tc in tool_calls:
-                fn   = tc.function.name
+                fn = tc.function.name
                 args = tc.function.arguments
                 if isinstance(args, str):
                     try:
@@ -2240,24 +2274,24 @@ class AgentWorker:
                         args = {}
                 reason = self._gate_tool_call(fn, args, allows_run, allowed_paths)
                 if reason:
-                    # Inject a synthetic tool result so the model knows it was blocked
-                    step_history.append({
-                        "role":      "tool",
-                        "tool_name": fn,
-                        "content":   reason,
-                    })
+                    step_history.append(
+                        {
+                            "role": "tool",
+                            "tool_name": fn,
+                            "content": reason,
+                        }
+                    )
                 else:
                     permitted.append(tc)
 
             if permitted:
                 think_acc = self._execute_tool_calls(permitted, step_history, think_acc)
 
-            # Check immediately after tool use — stop as soon as the step is
-            # satisfied rather than letting the model continue unnecessarily.
             if self._check_step_goal(step_text, step_history):
+                goal_confirmed = True
                 break
 
-        return content_out, think_acc
+        return content_out, think_acc, goal_confirmed
 
     def _extract_step_scope(self, step_text: str) -> Tuple[bool, List[str]]:
         """Parse the step description to derive what the executor is permitted to do.
@@ -2278,11 +2312,11 @@ class AgentWorker:
         # or quoted strings that look like file paths
         path_re = re.compile(
             r"(?:"
-            r"['\"]([^'\"]+\.[a-zA-Z0-9_]+)['\"]"   # quoted  'foo/bar.py'
+            r"['\"]([^'\"]+\.[a-zA-Z0-9_]+)['\"]"  # quoted  'foo/bar.py'
             r"|"
-            r"\b([\w./\\-]+\.[\w]{1,10})\b"           # bare    src/utils.py
+            r"\b([\w./\\-]+\.[\w]{1,10})\b"  # bare    src/utils.py
             r"|"
-            r"\b([\w-]+/[\w./\\-]+)\b"                # dir/    src/utils
+            r"\b([\w-]+/[\w./\\-]+)\b"  # dir/    src/utils
             r")"
         )
         paths: List[str] = []
@@ -2479,7 +2513,6 @@ class AgentWorker:
         system_prompt: str,
         think_acc_so_far: str,
         temperature: Optional[float] = None,
-        inject_plan: bool = True,
         tools: Optional[List[dict]] = None,
     ) -> Tuple[str, str, List[Any], dict]:
         """
@@ -2497,41 +2530,14 @@ class AgentWorker:
         tool_calls_raw: List[Any] = []
         in_think = False
 
-        _sys = system_prompt
-        if inject_plan:
-            with self._state.lock:
-                _todo = list(self._state.todo_items)
-            if _todo:
-                next_idx = next((i for i, t in enumerate(_todo) if not t.done), None)
-                plan_lines = []
-                for i, item in enumerate(_todo, 1):
-                    if item.done:
-                        plan_lines.append(f"[x] {i}. {item.text}")
-                    elif i - 1 == next_idx:
-                        plan_lines.append(
-                            f"[>] {i}. {item.text}  ← YOUR ONLY TASK RIGHT NOW"
-                        )
-                    else:
-                        plan_lines.append(f"[ ] {i}. {item.text}  (locked)")
-                current_task_text = (
-                    _todo[next_idx].text if next_idx is not None else "all done"
-                )
-                _sys += (
-                    "\n\n════════════════════════════════════════\n"
-                    "PLAN — ONE TASK AT A TIME\n"
-                    "════════════════════════════════════════\n"
-                    + "\n".join(plan_lines)
-                    + f"\n\nCURRENT TASK: {current_task_text}\n"
-                    "Do ONLY this task. Do not start locked tasks."
-                )
-        _active_tools = tools if tools is not None else _TOOLS
-        _opts = {"temperature": temperature} if temperature is not None else {}
+        active_tools = tools if tools is not None else _TOOLS
+        options = {"temperature": temperature} if temperature is not None else {}
         stream = ollama.chat(
             model=_MODEL,
-            messages=[{"role": "system", "content": _sys}] + history,
-            tools=_active_tools,
+            messages=[{"role": "system", "content": system_prompt}] + history,
+            tools=active_tools,
             stream=True,
-            options=_opts if _opts else None,
+            options=options if options else None,
         )
 
         for chunk in stream:
@@ -3314,7 +3320,9 @@ def render_frame(canvas: Canvas, state: AppState, tick: int) -> None:
         step_phase = state.step_phase
         replan_count = state.replan_count
 
-    PLAN_ROWS = 1 if (todo_items or (busy and step_phase and step_phase != "planning")) else 0
+    PLAN_ROWS = (
+        1 if (todo_items or (busy and step_phase and step_phase != "planning")) else 0
+    )
     STATUS_ROW = H - 1 - PLAN_ROWS
 
     username = getpass.getuser()
@@ -3396,7 +3404,7 @@ def render_frame(canvas: Canvas, state: AppState, tick: int) -> None:
                 #   rows 1..n+4    → _ov_row calls (PLAN, sep, items, sep, "i·close")
                 #   row n+5        → bottom border ╰─…─╯
                 plan_ov_last_row = len(todo_items) + 5
-                think_start_y    = plan_ov_last_row + 2
+                think_start_y = plan_ov_last_row + 2
                 think_rows_reserved = max(2, STATUS_ROW - think_start_y)
             else:
                 think_rows_reserved = min(len(think_display_lines) + 1, H - 4)
@@ -3430,7 +3438,11 @@ def render_frame(canvas: Canvas, state: AppState, tick: int) -> None:
         if step_phase == "planning":
             label = "Planning…"
         else:
-            label = (think_label[0].upper() + think_label[1:]) if think_label else "Thinking…"
+            label = (
+                (think_label[0].upper() + think_label[1:])
+                if think_label
+                else "Thinking…"
+            )
         elapsed = f"({time.time() - think_start:.0f}s)" if think_start else ""
         left = f"{Theme.SPIN}{spin}%reset " + _shimmer_line(label, tick)
         if elapsed:
@@ -3482,7 +3494,7 @@ def render_frame(canvas: Canvas, state: AppState, tick: int) -> None:
         _ov_row_y = [1]  # mutable so the nested fn can increment it
 
         def _ov_row(text: str, colour: str = "%reset") -> None:
-            clipped = text[:inner_w - 1] + "…" if len(text) > inner_w else text
+            clipped = text[: inner_w - 1] + "…" if len(text) > inner_w else text
             padded = clipped.ljust(inner_w)
             canvas.text(
                 1,
